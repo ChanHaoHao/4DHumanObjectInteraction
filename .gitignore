@@ -1,0 +1,6 @@
+.env.local
+body_models/
+data/
+results/
+cache/
+__pycache__/
