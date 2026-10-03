@@ -285,6 +285,10 @@ def reprojection(ep, frames, camera, inputs: ReprojectionInputs, body: MHRBody, 
         obj = ep["scale"] * object_local @ ep["rotation"][i].T + ep["translation"][i]
         label, depth = render_labels([human, obj], Ks, world_to_camera, (w, h))
         depth_map = inputs.frame("depth", frames[i])
+        if depth_map is not None and depth_map.shape != (h, w):  # depth may be coarser than masks
+            rows = np.arange(h) * depth_map.shape[0] // h
+            cols = np.arange(w) * depth_map.shape[1] // w
+            depth_map = depth_map[rows[:, None], cols[None, :]]
         for value, (name, mask) in enumerate(zip("ho", masks), 1):
             out[f"iou_{name}"].append(iou(label == value, mask.astype(bool)))
             if depth_map is not None:
