@@ -26,7 +26,8 @@ GT is held out, so every number here is a proxy (see notes/proxy_eval.md). Colum
 
 Inputs beyond the submission (both optional; Step 3 writes the cache):
   <episodes>/episode_XXXXXX_camera.npz   K [3,3] at video resolution, world_to_camera [4,4] (metres,
-                                         submission world frame), optional image_size (W, H)
+                                         submission world frame), optional image_size (W, H),
+                                         optional depth_scale (cache depth x this = world metres)
   <cache>/episode_XXXXXX/masks.npz       frames [N], human [N,h,w] bool, object [N,h,w] bool
   <cache>/episode_XXXXXX/depth.npz       frames [N], depth [N,h,w] metres (0 or non-finite = invalid)
 
@@ -210,7 +211,8 @@ def load_camera(directory: Path, episode: int):
         return None
     data = np.load(path)
     size = tuple(int(x) for x in data["image_size"]) if "image_size" in data else IMAGE_SIZE
-    return np.asarray(data["K"], np.float64), np.asarray(data["world_to_camera"], np.float64), size
+    scale = float(data["depth_scale"]) if "depth_scale" in data else 1.0
+    return np.asarray(data["K"], np.float64), np.asarray(data["world_to_camera"], np.float64), size, scale
 
 
 def render_labels(points_by_label, K, world_to_camera, size):
@@ -268,7 +270,7 @@ class ReprojectionInputs:
 
 
 def reprojection(ep, frames, camera, inputs: ReprojectionInputs, body: MHRBody, stride: int) -> dict:
-    K, world_to_camera, image_size = camera
+    K, world_to_camera, image_size, depth_scale = camera
     human_samples = surface_samples(ep["verts"][0], body.faces, 60000, 0)
     object_local = at_samples(ep["mesh_vertices"], ep["mesh_faces"],
                               surface_samples(ep["mesh_vertices"], ep["mesh_faces"], 30000, 1))
@@ -285,6 +287,8 @@ def reprojection(ep, frames, camera, inputs: ReprojectionInputs, body: MHRBody, 
         obj = ep["scale"] * object_local @ ep["rotation"][i].T + ep["translation"][i]
         label, depth = render_labels([human, obj], Ks, world_to_camera, (w, h))
         depth_map = inputs.frame("depth", frames[i])
+        if depth_map is not None:
+            depth_map = depth_map.astype(np.float32) * depth_scale
         if depth_map is not None and depth_map.shape != (h, w):  # depth may be coarser than masks
             rows = np.arange(h) * depth_map.shape[0] // h
             cols = np.arange(w) * depth_map.shape[1] // w
