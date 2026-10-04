@@ -100,6 +100,7 @@ class MHRBody:
             "body": np.sort(rng.choice(np.flatnonzero(~moved), 1024, replace=False)),
         }
         self.hands = np.concatenate([self.roles["left_hand"], self.roles["right_hand"]])
+        self.hand_all = hand  # every vertex the finger parameters move (both hands)
 
     def __call__(self, params, shape):
         torch = self.torch
