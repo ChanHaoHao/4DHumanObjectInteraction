@@ -5,7 +5,7 @@
 # ///
 """Score a Track 1 results folder with GT-free proxy metrics and print a per-episode table.
 
-    uv run scripts/proxy_eval.py results/<run>/episodes [--cache cache] [--reference DIR] [--csv out.csv]
+    uv run scripts/proxy_eval.py results/<run>/episodes [--cache cache] [--reference DIR] [--csv out.csv] [--depth-scale-from DIR]
 
 GT is held out, so every number here is a proxy (see notes/proxy_eval.md). Columns, all over scored frames:
 
@@ -344,7 +344,7 @@ def reference_metrics(ep, ref, frames, body: MHRBody, episode: int) -> dict:
 # --------------------------------------------------------------------------------------------- main
 def evaluate(episodes_dir: Path, *, cache: Path = DEFAULT_CACHE, reference: Path | None = None,
              episodes: list[int] | None = None, sample: Path = DEFAULT_SAMPLE, stride: int = 5,
-             body: MHRBody | None = None, log=print) -> pd.DataFrame:
+             body: MHRBody | None = None, depth_scale_from: Path | None = None, log=print) -> pd.DataFrame:
     if (episodes_dir / "episodes").is_dir():
         episodes_dir = episodes_dir / "episodes"
     if reference is not None and (reference / "episodes").is_dir():
@@ -366,6 +366,8 @@ def evaluate(episodes_dir: Path, *, cache: Path = DEFAULT_CACHE, reference: Path
                "acc_h": stretch_acceleration(ep["joints"], frames),
                "acc_o": stretch_acceleration(ep["translation"], frames)}
         camera = load_camera(episodes_dir, episode)
+        if camera is not None and depth_scale_from is not None:  # another run's scale for this cache's depth
+            camera = camera[:3] + (load_camera(depth_scale_from, episode)[3],)
         inputs = ReprojectionInputs(cache, episode)
         if camera is not None and inputs.masks is not None:
             row.update(reprojection(ep, frames, camera, inputs, body, stride))
@@ -406,10 +408,13 @@ def main() -> int:
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--device", default=None, help="default: cuda if available")
     parser.add_argument("--csv", type=Path, default=None, help="also write the per-episode table here")
+    parser.add_argument("--depth-scale-from", type=Path, default=None,
+                        help="episodes dir whose camera npz depth_scale to use (scoring against another cache)")
     args = parser.parse_args()
     subset = [int(e) for e in args.episodes.split(",")] if args.episodes else None
     table = evaluate(args.episodes_dir, cache=args.cache, reference=args.reference, episodes=subset,
-                     sample=args.sample, stride=args.stride, body=MHRBody(args.model, args.device))
+                     sample=args.sample, stride=args.stride, body=MHRBody(args.model, args.device),
+                     depth_scale_from=args.depth_scale_from)
     if table.empty:
         print(f"no episodes found in {args.episodes_dir}")
         return 1
