@@ -97,9 +97,11 @@ def gm(d: torch.Tensor, sigma: float) -> torch.Tensor:
 class Observations:
     """Per fitted frame, GPU tensors of everything the losses read (see module docstring)."""
 
-    def __init__(self, cache: Path, episode: int, frames: np.ndarray, K: np.ndarray, depth_scale: float,
+    def __init__(self, cache: Path, episode: int, frames: np.ndarray, K: np.ndarray, depth_scale,
                  seed: int = 0):
+        """depth_scale: one float, or one per fitted frame (cache depth x this = body-scale metres)."""
         rng = np.random.default_rng(seed)
+        scales = np.broadcast_to(np.asarray(depth_scale, np.float64), (len(frames),))
         folder = cache / f"episode_{episode:06d}"
         masks = np.load(folder / "masks.npz")
         dz = np.load(folder / "depth.npz")
@@ -122,6 +124,7 @@ class Observations:
         fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
         for i, f in enumerate(frames):
             obj, hum = obj_all[f], hum_all[f]
+            depth_scale = scales[i]
             area[i] = obj.sum()
             depth = depth_all[f].astype(np.float32)
             dmap[i] = depth * depth_scale

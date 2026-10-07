@@ -18,7 +18,8 @@ Per episode, on the fitted frames (scored span +- 15, as in Step 5), starting fr
      metric with alignment scale 1) and all hand vertices.
 
 Writes <run>/episodes/ (npz with the new object track, mesh and camera copied) and <run>/pushout.json.
-Needs the Step 3 cache (masks.npz, depth.npz) and the camera npz (K, depth_scale) next to each episode.
+Needs the Step 3 cache (masks.npz, depth.npz) and the camera npz (K, depth_scale) next to each episode; a
+depth_scale_frames array there (joint_fit.py: per frame 1 / k_t) is used instead of the single depth_scale.
 """
 
 from __future__ import annotations
@@ -186,8 +187,11 @@ def process(episode: int, args, body: MHRBody, budget, scored: np.ndarray) -> di
 
     total = len(data["pose"])
     frames = episode_range(scored, total)
-    obs = Observations(args.cache, episode, frames, cam["K"].astype(np.float64),
-                       float(cam.get("depth_scale", 1.0)), seed=args.seed)
+    if "depth_scale_frames" in cam:  # joint_fit.py: 1 / k_t per frame, the depth frame the object was placed in
+        depth_scale = np.asarray(cam["depth_scale_frames"], np.float64)[frames]
+    else:
+        depth_scale = float(cam.get("depth_scale", 1.0))
+    obs = Observations(args.cache, episode, frames, cam["K"].astype(np.float64), depth_scale, seed=args.seed)
     model = Model(trimesh.load(mesh_path, force="mesh"), N_REFINE, args.seed)
 
     pose = np.asarray(data["pose"], np.float64)
