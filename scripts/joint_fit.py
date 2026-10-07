@@ -16,6 +16,14 @@ init run and cache for some episodes, e.g. the hoop from the D4RT pipeline). Per
 1. Contact candidates. On scored frames (the contact span), body points whose projection lies within
    --contact-px (half-resolution px, or 10% of the object's size) of the object mask: hand and sole points
    first; other body points only when no hand or foot is near (sitting, hugging).
+1b. Rotation hypotheses (rotation_hypotheses): poses the image cannot tell apart, e.g. a ring's two tilts (same
+   ellipse) or a pan's handle direction (a few thin pixels), and that Step 5's tracking carried from its keyframe.
+   Per sampled frame, discrete states (turns about the thin axis, a flip, the tilt mirror) scored by data +
+   support (static, unheld frames: the centre of mass must stand over the lowest points, as an object at rest
+   does) [+ hand contact, --w-hand-h, off by default], Viterbi over frames with a rotation-jump cost.
+   Turns that map the mesh onto itself are one state (--sym-tol); an episode leaves the init only if the path
+   saves --hyp-min-gain per sampled frame, its re-fit fits the image within --hyp-fit-tol of the init and its
+   support is not worse (--hyp-rest-tol). Untouched episodes keep their track exactly (--no-rot-hyps: off).
 2. Depth along the ray (7b, per episode). Scaling the object and its track by alpha (s -> a s, t -> a t) leaves
    the image unchanged, so only depth, contact and the floor see it. alpha is chosen on a grid by
      mean data loss (depth terms, --w-dep-a, robust scale --sigma-a) + --w-contact-a x mean over contact frames of GM(nearest
@@ -53,12 +61,14 @@ import cv2
 import numpy as np
 import torch
 import trimesh
+from scipy.spatial import ConvexHull, cKDTree
+from scipy.spatial.transform import Rotation
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from human_post import moge_ratio, whittaker  # noqa: E402
 from human_vm import episode_range, parse_episodes  # noqa: E402
 from object_fit import (MASK_STEP, N_REFINE, Model, Observations, data_loss, gm, mat_to_rot6d,  # noqa: E402
-                        object_names, rot6d_to_mat)
+                        object_names, optimize, rot6d_to_mat)
 from proxy_eval import (DEFAULT_CACHE, DEFAULT_SAMPLE, MESH_SUFFIXES, MHRBody, budget_mesh, mesh_budget, ms,  # noqa: E402
                         scored_frames)
 from pushout import SDFGrid, exact_penetration, penetration_cm  # noqa: E402
@@ -151,6 +161,7 @@ class Episode:
         self.mesh = trimesh.load(self.mesh_path, force="mesh")
         self.R0 = ms._rotations(np.asarray(init["object_rotation"], np.float64))[frames]
         self.t0 = np.asarray(init["object_translation"], np.float64)[frames]
+        self.R_in, self.t_in = self.R0, self.t0  # the init track; stage 1b may replace R0/t0
         self.s0 = float(np.asarray(init["object_scale"]).reshape(-1)[0])
 
         pose = np.asarray(self.human["pose"], np.float64)[frames]
@@ -170,11 +181,12 @@ class Episode:
         h2, w2 = obj_masks.shape[1:]
         pts = verts[:, parts.index]
         cand = np.zeros(pts.shape[:2], bool)
+        hand_near = np.zeros(pts.shape[:2], bool)  # every fitted frame: hand points at the object mask in 2D
         scored_set = set(int(f) for f in scored)
         for i, f in enumerate(frames):
             obj = obj_masks[f]
             area = obj.sum()
-            if int(f) not in scored_set or area < 10:
+            if area < 10:
                 continue
             dt = cv2.distanceTransform((~obj).astype(np.uint8), cv2.DIST_L2, 5)
             X = pts[i]
@@ -185,6 +197,9 @@ class Episode:
             d = np.full(len(X), np.inf)
             d[ok] = dt[np.rint(v[ok]).astype(int), np.rint(u[ok]).astype(int)]
             near = d <= max(args.contact_px, 0.1 * np.sqrt(area))
+            hand_near[i] = near & (parts.kind == 0)
+            if int(f) not in scored_set:
+                continue
             limbs = near & (parts.kind < 2)
             cand[i] = limbs if limbs.any() else near & (parts.kind == 2)
         del obj_masks
@@ -203,6 +218,7 @@ class Episode:
 
         t = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float32, device=DEV)  # noqa: E731
         self.pts, self.cand = t(pts), torch.as_tensor(cand, device=DEV)
+        self.hand_near = torch.as_tensor(hand_near, device=DEV)
         self.has_contact = self.cand.any(1).float()
         self.hands_all = t(verts[:, body.hand_all])
         self.hands_512 = verts[:, body.hands]  # numpy, for the exact PEN check
@@ -215,6 +231,250 @@ class Episode:
 def floor_depth(X: torch.Tensor, ep: Episode, tol: float) -> torch.Tensor:
     """[n,N,3] object points -> [n,N] depth below the floor beyond tol, metres."""
     return torch.relu(ep.floor - tol - X @ ep.normal_t)
+
+
+# ------------------------------------------------------------------------------ 1b. rotation hypotheses
+def axis_angle(axis: np.ndarray, deg: float) -> np.ndarray:
+    return Rotation.from_rotvec(np.radians(deg) * axis / np.linalg.norm(axis)).as_matrix()
+
+
+def object_axes(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Thinnest and longest principal axes of the model points (object frame)."""
+    c = points - points.mean(0)
+    _, vecs = np.linalg.eigh(c.T @ c)
+    return vecs[:, 0], vecs[:, 2]
+
+
+def mirror_tilt(R: np.ndarray, t: np.ndarray, thin: np.ndarray) -> np.ndarray:
+    """[n,3,3] camera-frame rotations taking the object's thin axis to its reflection across the plane normal to
+    the viewing ray: the two tilts of a circle that project to the same ellipse (identity where they coincide)."""
+    n = R @ thin
+    ray = t / np.linalg.norm(t, axis=1, keepdims=True)
+    m = n - 2 * (n * ray).sum(1, keepdims=True) * ray
+    axis = np.cross(n, m)
+    sin = np.linalg.norm(axis, axis=1)
+    out = np.repeat(np.eye(3)[None], len(R), 0)
+    ok = sin > 1e-4
+    ang = np.arctan2(sin[ok], (n[ok] * m[ok]).sum(1))
+    out[ok] = Rotation.from_rotvec(axis[ok] / sin[ok, None] * ang[:, None]).as_matrix()
+    return out
+
+
+def static_frames(R: np.ndarray, t: np.ndarray, args) -> np.ndarray:
+    """Frames where the init track barely moves (median over +-5 frames of the per-frame motion)."""
+    v = np.linalg.norm(np.gradient(t, axis=0), axis=1)
+    dR = np.einsum("tij,tij->t", R[1:], R[:-1])
+    w = np.arccos(np.clip((dR - 1) / 2, -1, 1))
+    w = np.r_[w[:1], w]
+    med = lambda x: np.array([np.median(x[max(0, i - 5):i + 6]) for i in range(len(x))])  # noqa: E731
+    return (med(v) < args.static_v) & (med(w) < args.static_w)
+
+
+def support_cost(X: np.ndarray, com: np.ndarray, up: np.ndarray, size: float, args) -> float:
+    """An object at rest must stand on its lowest points: distance of the centre of mass (projected along `up`)
+    outside the convex hull of the points within --support-tol x size of the lowest, plus --w-low x the centre's
+    height above them; both / size. 0 for a ring lying flat, ~0.4 for a ring tilted 40 deg on one point of its rim;
+    a stool on its legs pays only the height part."""
+    h = X @ up
+    sup = X[h < h.min() + args.support_tol * size]
+    e1 = np.cross(up, [1.0, 0.0, 0.0] if abs(up[0]) < 0.9 else [0.0, 0.0, 1.0])
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(up, e1)
+    P = np.stack([sup @ e1, sup @ e2], 1)
+    c = np.array([com @ e1, com @ e2])
+    try:
+        eq = ConvexHull(P).equations
+        out = max(float((eq[:, :2] @ c + eq[:, 2]).max()), 0.0)
+    except Exception:  # fewer than 3 or collinear support points
+        out = float(np.linalg.norm(P - c, axis=1).min())
+    return (out + args.w_low * float(com @ up - h.min())) / size
+
+
+def viterbi(unary: np.ndarray, pair: np.ndarray) -> tuple[np.ndarray, float]:
+    """unary [S,K], pair [S-1,K,K] (from state at s-1 to state at s) -> min-cost path [S] and its cost."""
+    cost = unary[0].copy()
+    back = np.zeros(unary.shape, int)
+    for s in range(1, len(unary)):
+        c = cost[:, None] + pair[s - 1]
+        back[s] = c.argmin(0)
+        cost = c.min(0) + unary[s]
+    path = np.zeros(len(unary), int)
+    path[-1] = int(cost.argmin())
+    for s in range(len(unary) - 1, 0, -1):
+        path[s - 1] = back[s, path[s]]
+    return path, float(cost.min())
+
+
+def refit_track(ep: Episode, model: Model, R_init: np.ndarray, t_init: np.ndarray, args):
+    """Data terms + second differences + a pull to the given track (R, t free, scale fixed): settles a
+    hypothesis track on the image."""
+    n = len(ep.frames)
+    idx = torch.arange(n, device=DEV)
+    s = torch.full((n,), ep.s0, device=DEV)
+    Ri = torch.as_tensor(R_init, dtype=torch.float32, device=DEV)
+    ti = torch.as_tensor(t_init, dtype=torch.float32, device=DEV)
+    r6 = mat_to_rot6d(Ri).clone().requires_grad_(True)
+    t = ti.clone().requires_grad_(True)
+    opt = torch.optim.Adam([{"params": [r6], "lr": 0.01}, {"params": [t], "lr": 0.002}])
+    for _ in range(args.hyp_refine_steps):
+        opt.zero_grad()
+        R = rot6d_to_mat(r6)
+        acc_t = ((t[2:] - 2 * t[1:-1] + t[:-2]).norm(dim=-1) / args.acc_t) ** 2
+        acc_r = ((R[2:] - 2 * R[1:-1] + R[:-2]).flatten(1).norm(dim=-1) / args.acc_r) ** 2
+        prior = ((R - Ri) ** 2).sum((1, 2)).mean() + (((t - ti) / 0.05) ** 2).sum(1).mean()
+        loss = (data_loss(ep.obs, model, idx, R, t, s, args).mean() + args.w_smooth_h * (acc_t.mean() + acc_r.mean())
+                + args.w_prior * prior)
+        loss.backward()
+        opt.step()
+    with torch.no_grad():
+        R = rot6d_to_mat(r6).cpu().numpy().astype(np.float64)
+    R = np.stack([u @ vt for u, _, vt in (np.linalg.svd(r) for r in R)])
+    return R, t.detach().cpu().numpy().astype(np.float64)
+
+
+def rotation_hypotheses(ep: Episode, model: Model, args) -> dict:
+    """Stage 1b: rotations the image cannot tell apart, settled by contact and support (see the docstring).
+
+    States: the init track x {0, 90, 180, 270 deg about the object's thinnest axis} x {as is, flipped about its
+    longest axis} x {as is, tilt mirrored across the viewing ray}; state 0 is the init. Each is turned about the
+    model's centroid and re-fitted on every --hyp-stride-th frame (--hyp-steps, R and t). Per sampled frame:
+      data   the re-fitted data loss
+      hand   frames with hand points at the object mask in 2D: the nearest of them outside the mesh,
+             min(d / 10 cm, 3) x --w-hand-h (linear: far hands still count), at one alpha per episode
+             (the best of a grid, as in stage 2: the image cannot fix depth)
+      rest   static frames without a hand at the mask: support_cost x --w-rest
+    plus --w-jump-h x (rotation change / 0.5 rad)^2 between samples; Viterbi picks the path. If it leaves
+    state 0 anywhere, the new track (states spread to the frames between samples) is re-fitted with refit_track
+    and replaces ep.R0, ep.t0."""
+    pts_obj = model.points.cpu().numpy().astype(np.float64)
+    thin, long = object_axes(pts_obj)
+    com = pts_obj.mean(0)
+    Q = [axis_angle(long, flip) @ axis_angle(thin, yaw) for flip in (0, 180) for yaw in (0, 90, 180, 270)]
+    # turns that map the mesh onto itself (a ring about its axis, a roller end over end) are the same state
+    size_obj = float(np.ptp(pts_obj, 0).max())
+    tree = cKDTree(pts_obj - com)
+    distinct = []
+    for q in range(len(Q)):
+        moved = (pts_obj - com) @ Q[q].T
+        if all(tree.query(moved @ Q[p], workers=-1)[0].mean() > args.sym_tol * size_obj for p in distinct):
+            distinct.append(q)
+    states = [(q, m) for m in (0, 1) for q in distinct]
+    K = len(states)
+    n = len(ep.frames)
+    sample = np.arange(0, n, args.hyp_stride)
+    sample = sample[ep.obs.has.cpu().numpy()[sample] > 0]
+    if len(sample) < 3:
+        return {"changed": False, "reason": "fewer than 3 frames with a mask"}
+    S = len(sample)
+    M = mirror_tilt(ep.R0, ep.t0, thin)
+    R_c = np.empty((S, K, 3, 3))
+    t_c = np.empty((S, K, 3))
+    for j, (q, m) in enumerate(states):
+        Rn = (M[sample] if m else np.eye(3)) @ ep.R0[sample] @ Q[q]
+        R_c[:, j] = Rn
+        t_c[:, j] = ep.t0[sample] + ep.s0 * (ep.R0[sample] @ com - Rn @ com)  # centroid stays put
+
+    # re-fit every (sample, state) a little
+    f32 = lambda a: torch.as_tensor(a, dtype=torch.float32, device=DEV)  # noqa: E731
+    flat_R, flat_t = f32(R_c.reshape(-1, 3, 3)), f32(t_c.reshape(-1, 3))
+    flat_i = torch.as_tensor(np.repeat(sample, K), device=DEV)
+    logs = torch.full((len(flat_i),), float(np.log(ep.s0)), device=DEV)
+    Rs, ts, ds = [], [], []
+    for a in range(0, len(flat_i), args.hyp_batch):
+        sl = slice(a, a + args.hyp_batch)
+        R, t, _, loss = optimize(ep.obs, model, flat_i[sl], flat_R[sl], flat_t[sl], logs[sl], args, args.hyp_steps,
+                                 fit_scale=False, lr=(0.02, 0.005, 0.0))
+        Rs.append(R), ts.append(t), ds.append(loss)
+    R = torch.cat(Rs).reshape(S, K, 3, 3)
+    t = torch.cat(ts).reshape(S, K, 3)
+    data = torch.cat(ds).reshape(S, K).cpu().numpy()
+
+    # hand contact, per alpha
+    hand = ep.hand_near[torch.as_tensor(sample, device=DEV)]
+    held = hand.any(1)
+    pts = ep.pts[torch.as_tensor(sample, device=DEV)]
+    alphas = np.exp(np.linspace(*np.log(args.hyp_alpha), args.hyp_alpha_steps)) if args.w_hand_h > 0 else np.ones(1)
+    contact = np.zeros((len(alphas), S, K))
+    with torch.no_grad():
+        for ai, a in enumerate(alphas):
+            for j in range(K):
+                d = nearest(outside_distance(pts, R[:, j], a * t[:, j], torch.full((S,), a * ep.s0, device=DEV),
+                                             ep.sdf), hand)
+                contact[ai, :, j] = ((d / 0.1).clamp(max=3) * held).cpu().numpy()
+
+    # support on static, unheld frames
+    rest = static_frames(ep.R0, ep.t0, args)[sample] & ~held.cpu().numpy()
+    Rn, tn = R.cpu().numpy().astype(np.float64), t.cpu().numpy().astype(np.float64)
+    size = ep.s0 * float(np.ptp(pts_obj, 0).max())
+    stab = np.zeros((S, K))
+    for i in np.flatnonzero(rest):
+        for j in range(K):
+            X = ep.s0 * pts_obj @ Rn[i, j].T + tn[i, j]
+            stab[i, j] = support_cost(X, ep.s0 * Rn[i, j] @ com + tn[i, j], ep.normal, size, args)
+
+    # rotation change between consecutive samples, every pair of states: pair[s-1, k, l] from k to l
+    cos = np.einsum("skij,slij->skl", Rn[:-1], Rn[1:])  # trace(R_a^T R_b)
+    ang = np.arccos(np.clip((cos - 1) / 2, -1, 1))
+    pair = args.w_jump_h * (ang / 0.5) ** 2
+
+    best = None
+    for ai in range(len(alphas)):
+        unary = data + args.w_hand_h * contact[ai] + args.w_rest * stab
+        path, cost = viterbi(unary, pair)
+        if best is None or cost < best[1]:
+            best = (ai, cost, path, unary)
+    ai, cost, path, unary = best
+    keep_cost = float(unary[:, 0].sum() + pair[np.arange(S - 1), 0, 0].sum())
+    rows = np.arange(S)
+    pick = lambda arr: float(arr[rows, path].sum())  # noqa: E731
+    keep = lambda arr: float(arr[:, 0].sum())  # noqa: E731
+    info = {"samples": S, "rest_samples": int(rest.sum()), "held_samples": int(held.sum()),
+            "alpha": round(float(alphas[ai]), 3), "cost_keep": round(keep_cost, 3), "cost_best": round(cost, 3),
+            "states": {f"q{q}{'m' if m else ''}": int((path == j).sum()) for j, (q, m) in enumerate(states)
+                       if (path == j).any()},
+            "data": [round(keep(data), 3), round(pick(data), 3)],
+            "hand": [round(keep(contact[ai]) * args.w_hand_h, 3), round(pick(contact[ai]) * args.w_hand_h, 3)],
+            "rest": [round(keep(stab) * args.w_rest, 3), round(pick(stab) * args.w_rest, 3)]}
+    turn0 = np.degrees(np.arccos(np.clip((np.einsum("skij,sij->sk", Rn, Rn[:, 0]) - 1) / 2, -1, 1)))
+    info["per_state"] = {f"q{q}{'m' if m else ''}": {  # whole-episode sums if the state were kept throughout
+        "data": round(float(data[:, j].sum()), 2), "hand": round(float(contact[ai][:, j].sum() * args.w_hand_h), 2),
+        "rest": round(float(stab[:, j].sum() * args.w_rest), 2), "deg_from_q0": round(float(turn0[:, j].mean()), 1)}
+        for j, (q, m) in enumerate(states)}
+    if not path.any() or keep_cost - cost < args.hyp_min_gain * S:
+        return {"changed": False, **info}
+
+    # spread the states to all fitted frames, re-fit the track
+    near = np.clip(np.searchsorted(sample, np.arange(n)), 0, S - 1)
+    left = np.clip(near - 1, 0, S - 1)
+    near = np.where(np.abs(sample[left] - np.arange(n)) < np.abs(sample[near] - np.arange(n)), left, near)
+    state = path[near]
+    R_new = np.empty_like(ep.R0)
+    t_new = np.empty_like(ep.t0)
+    for j, (q, m) in enumerate(states):
+        f = state == j
+        if f.any():
+            R_new[f] = (M[f] if m else np.eye(3)) @ ep.R0[f] @ Q[q]
+            t_new[f] = ep.t0[f] + ep.s0 * (ep.R0[f] @ com - R_new[f] @ com)
+    shift = tn[rows, path] - t_c[rows, path]  # what the short re-fit moved, interpolated in between
+    t_new += np.stack([np.interp(np.arange(n), sample, shift[:, k]) for k in range(3)], 1)
+    R_fit, t_fit = refit_track(ep, model, R_new, t_new, args)
+    turn = np.degrees(np.arccos(np.clip((np.einsum("tij,tij->t", R_fit, ep.R0) - 1) / 2, -1, 1)))
+    # guard: the new track must fit the image about as well as the init (support breaks ties, it does not
+    # buy a worse silhouette)
+    with torch.no_grad():
+        idx = torch.arange(n, device=DEV)
+        s = torch.full((n,), ep.s0, device=DEV)
+        fit_old = float(data_loss(ep.obs, model, idx, f32(ep.R0), f32(ep.t0), s, args).mean())
+        fit_new = float(data_loss(ep.obs, model, idx, f32(R_fit), f32(t_fit), s, args).mean())
+    info.update(frames_changed=int((state != 0).sum()), turn_deg_mean=round(float(turn.mean()), 1),
+                turn_deg_p90=round(float(np.percentile(turn, 90)), 1), fit_old=round(fit_old, 4),
+                fit_new=round(fit_new, 4))
+    if fit_new > fit_old + args.hyp_fit_tol:
+        return {"changed": False, "rejected": "image fit worse", **info}
+    if pick(stab) * args.w_rest > keep(stab) * args.w_rest + args.hyp_rest_tol:  # data alone moved it, and the
+        return {"changed": False, "rejected": "support worse", **info}  # scene got less plausible (hoop ep 2)
+    ep.R0, ep.t0 = R_fit, t_fit
+    return {"changed": True, **info}
 
 
 def stage_a(ep: Episode, model: Model, alphas: np.ndarray, args, stride: int = 2) -> dict[str, np.ndarray]:
@@ -408,6 +668,12 @@ def process_object(name: str, episodes: list[int], args, body, parts, budget, sc
     t_load = time.time() - t1
     grid = np.exp(np.linspace(np.log(args.alpha_range[0]), np.log(args.alpha_range[1]), args.alpha_steps))
     models = {ep.episode: Model(ep.mesh, N_REFINE, args.seed) for ep in eps}
+    hyps = {}
+    for ep in eps:
+        t1 = time.time()
+        hyps[ep.episode] = rotation_hypotheses(ep, models[ep.episode], args) if args.rot_hyps else {"changed": False}
+        hyps[ep.episode]["seconds"] = round(time.time() - t1, 1)
+        print(f"ep {ep.episode:2d} {name}: rotation hypotheses {hyps[ep.episode]}", flush=True)
     curves = {}
     for ep in eps:
         rel = np.exp(np.log(np.median([e.s0 for e in eps])) + np.log(grid)) / ep.s0  # common absolute grid
@@ -422,11 +688,11 @@ def process_object(name: str, episodes: list[int], args, body, parts, budget, sc
     for ep in eps:
         t1 = time.time()
         model = models[ep.episode]
-        before = contact_report(ep, ep.R0, ep.t0, ep.s0, model, args)
+        before = contact_report(ep, ep.R_in, ep.t_in, ep.s0, model, args)
         R, t, s, parts_, data_frames = refine(ep, model, alphas[ep.episode], args)
         after = contact_report(ep, R, t, s, model, args)
         st = write_episode(ep, args, R, t, s, alphas[ep.episode], parts_, data_frames, before, after,
-                           {"object": name, "object_episodes": episodes,
+                           {"object": name, "object_episodes": episodes, "rotation_hypotheses": hyps[ep.episode],
                             "timing_s": {"load_all": round(t_load, 1), "fit": round(time.time() - t1, 1)}})
         stats.append(st)
         print(f"ep {ep.episode:2d} {name}: alpha {st['alpha']:.3f} (scale {ep.s0:.3f} -> {s:.3f} m), k_t "
@@ -453,6 +719,32 @@ def main():
     parser.add_argument("--lam-k", type=float, default=100.0, help="Whittaker lambda on log k_t")
     # 1. contact candidates
     parser.add_argument("--contact-px", type=float, default=4.0, help="half-resolution px from the object mask")
+    # 1b. rotation hypotheses
+    parser.add_argument("--no-rot-hyps", dest="rot_hyps", action="store_false")
+    parser.add_argument("--hyp-stride", type=int, default=3)
+    parser.add_argument("--hyp-steps", type=int, default=30, help="re-fit steps per (frame, state)")
+    parser.add_argument("--hyp-batch", type=int, default=256)
+    parser.add_argument("--hyp-alpha", type=float, nargs=2, default=[0.6, 1.8])
+    parser.add_argument("--hyp-alpha-steps", type=int, default=13)
+    parser.add_argument("--w-hand-h", type=float, default=0.0,
+                        help="per frame, x min(hand distance / 10 cm, 3); off: at one depth per episode the distance is mostly depth error (pan: every state 10 cm off), and it flipped hoop ep 2 / foam roll ep 21 to worse silhouettes")
+    parser.add_argument("--w-rest", type=float, default=1.0, help="per static unheld frame, x support_cost")
+    parser.add_argument("--w-low", type=float, default=0.1, help="centre height in support_cost (a tie-break)")
+    parser.add_argument("--support-tol", type=float, default=0.1,
+                        help="x object size: points this close to the lowest support it (0.03 read a flat pan tilted 5 deg as unstable)")
+    parser.add_argument("--static-v", type=float, default=0.005, help="m/frame")
+    parser.add_argument("--static-w", type=float, default=0.02, help="rad/frame")
+    parser.add_argument("--w-jump-h", type=float, default=1.0)
+    parser.add_argument("--hyp-min-gain", type=float, default=0.03, help="per sampled frame, to leave the init")
+    parser.add_argument("--hyp-fit-tol", type=float, default=0.02,
+                        help="mean data loss the new track may lose against the init, else it is rejected "
+                             "(hoop ep 0, fixed: +0.014; foam roll ep 21, worse silhouette: +0.095)")
+    parser.add_argument("--hyp-rest-tol", type=float, default=0.1,
+                        help="support cost (episode sum) the new path may add, else it is rejected")
+    parser.add_argument("--sym-tol", type=float, default=0.02, help="x size: turns this close are one state")
+    parser.add_argument("--hyp-refine-steps", type=int, default=200)
+    parser.add_argument("--w-smooth-h", type=float, default=0.1, help="Step 5's smoothness in the hypothesis re-fit")
+    parser.add_argument("--w-prior", type=float, default=1.0, help="pull of the re-fit to the hypothesis track")
     # 2. alpha search
     parser.add_argument("--no-stage-a", dest="stage_a", action="store_false")
     parser.add_argument("--alpha-range", type=float, nargs=2, default=[0.4, 2.5])
