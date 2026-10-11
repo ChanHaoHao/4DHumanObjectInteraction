@@ -224,7 +224,15 @@ def data_loss(obs: Observations, model: Model, idx: torch.Tensor, R, t, s, args,
     u2, v2 = (uf - 0.5) / MASK_STEP, (vf - 0.5) / MASK_STEP
     inside = (u2 >= 0) & (u2 <= w2 - 1) & (v2 >= 0) & (v2 <= h2 - 1) & (X[..., 2] > 0.05)
     size = obs.size[idx][:, None]
-    l_in = (gm(sample_map(obs.dt, idx, u2, v2) / size, args.sil_sigma) * inside).mean(1)
+    dist = sample_map(obs.dt, idx, u2, v2)
+    occ = getattr(args, "occ_depth", 0.0)
+    if occ > 0 and getattr(obs, "dt_obj", None) is not None:
+        # the actor hides only what lies behind it: a point more than occ (m) in front of the depth map there is
+        # visible, so over the actor it counts as outside the object mask (a pan held face-on in front of the torso)
+        scene = sample_map(obs.dmap, idx, (uf - 1.5) / DEPTH_STEP, (vf - 1.5) / DEPTH_STEP)
+        front = ((scene > 0) & (X[..., 2] < scene - occ)).detach()
+        dist = torch.where(front, sample_map(obs.dt_obj, idx, u2, v2), dist)
+    l_in = (gm(dist / size, args.sil_sigma) * inside).mean(1)
     c = torch.cdist(obs.mask_pts[idx], torch.stack([u2, v2], -1)).min(-1).values
     mw = obs.mask_w[idx]
     l_cov = (gm(c / size, args.sil_sigma) * mw).sum(1) / mw.sum(1).clamp_min(1)
@@ -592,12 +600,14 @@ def main():
     parser.add_argument("--acc-t", type=float, default=0.005, help="m/frame^2 scale of the translation penalty")
     parser.add_argument("--acc-r", type=float, default=0.02, help="rad/frame^2 scale of the rotation penalty")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--per-episode", action="store_true",
+                        help="fit each episode alone (own mesh and scale) instead of grouping by object name")
     args = parser.parse_args()
     scored = scored_frames(args.sample)
     meta = args.run / "object_meta"
     meta.mkdir(parents=True, exist_ok=True)
-    names = object_names(args.data)
     wanted = parse_episodes(args.episodes)
+    names = {e: f"episode_{e:06d}" for e in wanted} if args.per_episode else object_names(args.data)
     groups = {}  # object -> its requested episodes, in request order
     for e in wanted:
         groups.setdefault(names[e], []).append(e)

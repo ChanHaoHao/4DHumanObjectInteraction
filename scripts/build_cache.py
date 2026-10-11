@@ -321,12 +321,14 @@ def overlay(episode: int, folder: Path, out: Path, scored: np.ndarray, data: Pat
 
 
 # ----------------------------------------------------------------------------------------------- main
-def build(episode: int, raw: Path, out: Path, scored: np.ndarray, data: Path, check: Path | None) -> dict:
+def build(episode: int, raw: Path, out: Path, scored: np.ndarray, data: Path, check: Path | None,
+          objects: list[str] | None = None) -> dict:
     src, dst = raw / f"episode_{episode:06d}", out / f"episode_{episode:06d}"
     dst.mkdir(parents=True, exist_ok=True)
     (dst / "meta.json").unlink(missing_ok=True)
     people = load_tracks(src / "sam_person.npz")
-    objects = load_tracks(src / "sam_object.npz", *sorted(src.glob("sam_object_*.npz")))
+    objects = load_tracks(*([src / f for f in objects] if objects else
+                            [src / "sam_object.npz", *sorted(src.glob("sam_object_*.npz"))]))
     T = people["masks"].shape[1]
     raw_depth = dict(np.load(src / "depth_raw.npz")) if (src / "depth_raw.npz").exists() else None
     chosen = select(people, objects, scored, None if raw_depth is None else raw_depth["depth"])
@@ -371,15 +373,17 @@ def main():
     parser.add_argument("--episodes", default="0-29")
     parser.add_argument("--overlay", type=Path, help="also write a check image per episode here")
     parser.add_argument("--overlay-only", action="store_true", help="skip building; just draw overlays")
+    parser.add_argument("--objects", nargs="+", help="object track files in the raw folder to use instead of "
+                        "sam_object.npz + sam_object_*.npz (e.g. the motion candidates)")
     args = parser.parse_args()
     scored = scored_frames(args.sample)
     rows = []
     for episode in parse_episodes(args.episodes):
         if not args.overlay_only:
-            if not (args.raw / f"episode_{episode:06d}" / "sam_object.npz").exists():
+            if not (args.raw / f"episode_{episode:06d}" / (args.objects or ["sam_object.npz"])[0]).exists():
                 print(f"ep {episode}: no raw SAM output, skipped")
                 continue
-            meta = build(episode, args.raw, args.out, scored[episode], args.data, args.overlay)
+            meta = build(episode, args.raw, args.out, scored[episode], args.data, args.overlay, args.objects)
             keys = ["warning", "contact", "human_ids", "object_ids", "human_coverage_scored", "object_coverage_scored",
                     "object_area_px_scored_median", "fov_x", "depth_scale_std", "camera_height_m", "actor_top_m_p90"]
             rows.append({"ep": episode, **{k: meta.get(k) for k in keys}})

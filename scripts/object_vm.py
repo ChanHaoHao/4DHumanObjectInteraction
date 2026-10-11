@@ -164,6 +164,8 @@ def stage_crops(args, episodes):
             tiles.append(tile)
         index.write_text(json.dumps(info, indent=1))
         print(f"ep {e}: " + ", ".join(f"f{i['frame']} s{i['score']} a{i['area_half_px']}" for i in info), flush=True)
+    if not tiles:  # no episode had a usable object mask: nothing to draw
+        return
     per_row = 3 * 3
     while len(tiles) % per_row:
         tiles.append(np.full_like(tiles[0], 255))

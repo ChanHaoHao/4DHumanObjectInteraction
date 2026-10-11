@@ -24,6 +24,11 @@ init run and cache for some episodes, e.g. the hoop from the D4RT pipeline). Per
    Turns that map the mesh onto itself are one state (--sym-tol); an episode leaves the init only if the path
    saves --hyp-min-gain per sampled frame, its re-fit fits the image within --hyp-fit-tol of the init and its
    support is not worse (--hyp-rest-tol). Untouched episodes keep their track exactly (--no-rot-hyps: off).
+   Optional depth targets (--w-zrest, --w-zhand): each state starts at the depth map's depth on static frames or
+   at the hand's depth on held ones, and pays for how far the image re-fit moves it off that depth.
+   Optional before 1b: --depth-gate drops depth behind the holding hand (thin held objects show the
+   background); --rest-scale sets one scale for the object from its static frames' depth (replaces stage 2's
+   alpha when it has --rest-min of them).
 2. Depth along the ray (7b, per episode). Scaling the object and its track by alpha (s -> a s, t -> a t) leaves
    the image unchanged, so only depth, contact and the floor see it. alpha is chosen on a grid by
      mean data loss (depth terms, --w-dep-a, robust scale --sigma-a) + --w-contact-a x mean over contact frames of GM(nearest
@@ -139,6 +144,22 @@ def depth_scales(cache: Path, episode: int, frames, verts, K, lam: float, fallba
     return np.exp(-logk), ratio, vis
 
 
+def gate_depth(obs: Observations, hand_z: np.ndarray, gate: float) -> int:
+    """On frames with hand points at the object mask, drop the object's depth data farther than the hand + gate (m):
+    a thin held object (the black pan) shows the background through and around it, 1-3 m behind the person.
+    Returns the number of frames that lost depth points."""
+    ok = np.isfinite(hand_z)
+    if not ok.any():
+        return 0
+    lim = torch.as_tensor(np.where(ok, hand_z + gate, np.inf), dtype=torch.float32, device=DEV)
+    far = obs.depth_pts[..., 2] > lim[:, None]
+    obs.depth_w[far] = 0
+    for i in np.flatnonzero(ok):
+        obs.omap[i][obs.dmap[i].float() > lim[i]] = 0
+    obs.has_depth = (obs.depth_w.sum(1) >= 5).float()
+    return int(far.any(1).sum())
+
+
 # ----------------------------------------------------------------------------------------- episodes
 class Episode:
     """Everything one episode's fit reads, on the GPU where the losses need it."""
@@ -162,7 +183,7 @@ class Episode:
         self.R0 = ms._rotations(np.asarray(init["object_rotation"], np.float64))[frames]
         self.t0 = np.asarray(init["object_translation"], np.float64)[frames]
         self.R_in, self.t_in = self.R0, self.t0  # the init track; stage 1b may replace R0/t0
-        self.s0 = float(np.asarray(init["object_scale"]).reshape(-1)[0])
+        self.s0 = self.s_in = float(np.asarray(init["object_scale"]).reshape(-1)[0])  # --rest-scale may change s0
 
         pose = np.asarray(self.human["pose"], np.float64)[frames]
         params = np.concatenate([pose, np.broadcast_to(self.human["scales"], (n, 68))], 1)
@@ -202,8 +223,21 @@ class Episode:
                 continue
             limbs = near & (parts.kind < 2)
             cand[i] = limbs if limbs.any() else near & (parts.kind == 2)
+        self.mask_still = mask_static(obj_masks[frames], args)
+        if args.occ_depth > 0:  # object mask alone, for object_fit.data_loss's depth-aware occlusion
+            dto = np.stack([cv2.distanceTransform((~obj_masks[f]).astype(np.uint8), cv2.DIST_L2, 5) for f in frames])
+            self.obs.dt_obj = torch.as_tensor(dto.astype(np.float16), device=DEV)
+            del dto
         del obj_masks
-        self.cand_kind = np.array([np.bincount(parts.kind[c], minlength=3) > 0 for c in cand])  # [n,3]
+        self.cand_kind =np.array([np.bincount(parts.kind[c], minlength=3) > 0 for c in cand])  # [n,3]
+        hz = np.where(hand_near, pts[..., 2], np.nan)
+        self.hand_z = np.full(n, np.nan)  # depth of the hand points at the object mask, per fitted frame
+        has_hand = hand_near.any(1)
+        self.hand_z[has_hand] = np.nanmedian(hz[has_hand], axis=1)
+        self.gated = gate_depth(self.obs, self.hand_z, args.depth_gate) if args.depth_gate > 0 else 0
+        w = self.obs.depth_w.cpu().numpy() > 0
+        zs = self.obs.depth_pts[..., 2].cpu().numpy()
+        self.z_map = np.array([np.median(z[k]) if k.sum() >= 5 else np.nan for z, k in zip(zs, w)])
 
         # floor in the body's frame: Step 3 normal, offset from the body's lowest points
         meta = json.loads((self.cache / name / "meta.json").read_text())
@@ -270,6 +304,24 @@ def static_frames(R: np.ndarray, t: np.ndarray, args) -> np.ndarray:
     return (med(v) < args.static_v) & (med(w) < args.static_w)
 
 
+def mask_static(masks: np.ndarray, args) -> np.ndarray:
+    """[n,h,w] object masks -> [n] frames where the mask stands still (median over +-5 frames of the centroid's
+    motion < --static-px half-res px/frame and of the area change < 3%/frame). The image's own evidence of rest;
+    Step 5's track wobbles by 10-18 cm along the ray on a pan lying on a table (ep 13)."""
+    area = masks.sum((1, 2)).astype(float)
+    ys = np.arange(masks.shape[1], dtype=float)
+    xs = np.arange(masks.shape[2], dtype=float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        c = np.stack([(masks.sum(1) * xs).sum(1) / area, (masks.sum(2) * ys).sum(1) / area], 1)
+        da = np.abs(np.diff(np.log(np.maximum(area, 1))))
+    v = np.linalg.norm(np.diff(c, axis=0), axis=1)
+    v, da = np.r_[v[:1], v], np.r_[da[:1], da]
+    bad = ~np.isfinite(v) | (area < 10)
+    v[bad], da[bad] = np.inf, np.inf
+    med = lambda x: np.array([np.median(x[max(0, i - 5):i + 6]) for i in range(len(x))])  # noqa: E731
+    return (med(v) < args.static_px) & (med(da) < 0.03) & (area >= 10)
+
+
 def support_cost(X: np.ndarray, com: np.ndarray, up: np.ndarray, size: float, args) -> float:
     """An object at rest must stand on its lowest points: distance of the centre of mass (projected along `up`)
     outside the convex hull of the points within --support-tol x size of the lowest, plus --w-low x the centre's
@@ -288,6 +340,16 @@ def support_cost(X: np.ndarray, com: np.ndarray, up: np.ndarray, size: float, ar
     except Exception:  # fewer than 3 or collinear support points
         out = float(np.linalg.norm(P - c, axis=1).min())
     return (out + args.w_low * float(com @ up - h.min())) / size
+
+
+def farthest_points(points: np.ndarray, k: int) -> np.ndarray:
+    """k points spread over the model (farthest-point sampling from the one farthest from the centroid)."""
+    pick = [int(np.argmax(np.linalg.norm(points - points.mean(0), axis=1)))]
+    d = np.linalg.norm(points - points[pick[0]], axis=1)
+    for _ in range(k - 1):
+        pick.append(int(np.argmax(d)))
+        d = np.minimum(d, np.linalg.norm(points - points[pick[-1]], axis=1))
+    return points[pick]
 
 
 def viterbi(unary: np.ndarray, pair: np.ndarray) -> tuple[np.ndarray, float]:
@@ -349,7 +411,8 @@ def rotation_hypotheses(ep: Episode, model: Model, args) -> dict:
     pts_obj = model.points.cpu().numpy().astype(np.float64)
     thin, long = object_axes(pts_obj)
     com = pts_obj.mean(0)
-    Q = [axis_angle(long, flip) @ axis_angle(thin, yaw) for flip in (0, 180) for yaw in (0, 90, 180, 270)]
+    Q = [axis_angle(long, flip) @ axis_angle(thin, yaw) for flip in ((0, 180, 90, 270) if args.hyp_tilt else (0, 180))
+         for yaw in (0, 90, 180, 270)]
     # turns that map the mesh onto itself (a ring about its axis, a roller end over end) are the same state
     size_obj = float(np.ptp(pts_obj, 0).max())
     tree = cKDTree(pts_obj - com)
@@ -374,9 +437,25 @@ def rotation_hypotheses(ep: Episode, model: Model, args) -> dict:
         R_c[:, j] = Rn
         t_c[:, j] = ep.t0[sample] + ep.s0 * (ep.R0[sample] @ com - Rn @ com)  # centroid stays put
 
+    # depth targets: the depth map on static frames (--w-zrest), the hand on the others (--w-zhand). Every state
+    # starts with its centroid at the target, so the re-fit asks which rotation explains the image at that depth
+    z_tgt = np.full(S, np.nan)
+    w_z = np.zeros(S)
+    if args.w_zrest > 0:
+        at = ep.rest[sample] & np.isfinite(ep.z_map[sample])
+        z_tgt[at], w_z[at] = ep.z_map[sample][at], args.w_zrest
+    if args.w_zhand > 0:
+        at = ~ep.rest[sample] & np.isfinite(ep.hand_z[sample])
+        z_tgt[at], w_z[at] = ep.hand_z[sample][at], args.w_zhand
+    t_start = t_c.copy()
+    placed = np.isfinite(z_tgt)
+    if placed.any():
+        c = ep.s0 * np.einsum("skij,j->ski", R_c, com) + t_c  # centroids [S,K,3]
+        t_start[placed] += c[placed] * (z_tgt[placed, None, None] / c[placed][..., 2:] - 1)
+
     # re-fit every (sample, state) a little
     f32 = lambda a: torch.as_tensor(a, dtype=torch.float32, device=DEV)  # noqa: E731
-    flat_R, flat_t = f32(R_c.reshape(-1, 3, 3)), f32(t_c.reshape(-1, 3))
+    flat_R, flat_t = f32(R_c.reshape(-1, 3, 3)), f32(t_start.reshape(-1, 3))
     flat_i = torch.as_tensor(np.repeat(sample, K), device=DEV)
     logs = torch.full((len(flat_i),), float(np.log(ep.s0)), device=DEV)
     Rs, ts, ds = [], [], []
@@ -412,19 +491,47 @@ def rotation_hypotheses(ep: Episode, model: Model, args) -> dict:
             X = ep.s0 * pts_obj @ Rn[i, j].T + tn[i, j]
             stab[i, j] = support_cost(X, ep.s0 * Rn[i, j] @ com + tn[i, j], ep.normal, size, args)
 
+    # depth: how far the image re-fit moved each placed state's centroid off its target (log ratio / 5%, max 3)
+    zc = np.zeros((S, K))
+    if placed.any():
+        cz = (ep.s0 * np.einsum("skij,j->ski", Rn, com) + tn)[..., 2]
+        zc[placed] = np.minimum(np.abs(np.log(cz[placed] / z_tgt[placed, None])) / 0.05, 3) * w_z[placed, None]
+
+    # grasp (--w-grasp): a held object is held by the same part throughout. Per grasp candidate g (--grasp-points
+    # spread over the model), held sample and state: 2D distance from g's projection to the hand points at the
+    # mask, / object size in px, max 2. In 2D on purpose: the body's hands are right in the image, not in depth
+    held_np = held.cpu().numpy()
+    gc = np.zeros((1, S, K))
+    G = np.zeros((1, 3))
+    if args.w_grasp > 0 and held_np.any():
+        G = farthest_points(pts_obj, args.grasp_points)
+        Kc = ep.obs.K
+        P = pts.cpu().numpy()
+        hand_np = hand.cpu().numpy()
+        huv = np.zeros((S, 2))
+        for i in np.flatnonzero(held_np):
+            q = P[i][hand_np[i]]
+            huv[i] = (q[:, :2] / q[:, 2:] * Kc[[0, 1], [0, 1]] + Kc[:2, 2]).mean(0)
+        X = ep.s0 * np.einsum("skij,gj->skgi", Rn, G) + tn[:, :, None]  # [S,K,G,3]
+        uv = X[..., :2] / np.maximum(X[..., 2:], 1e-3) * Kc[[0, 1], [0, 1]] + Kc[:2, 2]
+        size = ep.obs.size.cpu().numpy()[sample] * MASK_STEP  # full-resolution px
+        d = np.linalg.norm(uv - huv[:, None, None], axis=-1) / size[:, None, None]
+        gc = (np.minimum(d, 2) * held_np[:, None, None]).transpose(2, 0, 1) * args.w_grasp  # [G,S,K]
+
     # rotation change between consecutive samples, every pair of states: pair[s-1, k, l] from k to l
     cos = np.einsum("skij,slij->skl", Rn[:-1], Rn[1:])  # trace(R_a^T R_b)
     ang = np.arccos(np.clip((cos - 1) / 2, -1, 1))
     pair = args.w_jump_h * (ang / 0.5) ** 2
 
-    best = None
+    best, keep_cost = None, np.inf
     for ai in range(len(alphas)):
-        unary = data + args.w_hand_h * contact[ai] + args.w_rest * stab
-        path, cost = viterbi(unary, pair)
-        if best is None or cost < best[1]:
-            best = (ai, cost, path, unary)
-    ai, cost, path, unary = best
-    keep_cost = float(unary[:, 0].sum() + pair[np.arange(S - 1), 0, 0].sum())
+        for gi in range(len(gc)):
+            unary = data + args.w_hand_h * contact[ai] + args.w_rest * stab + zc + gc[gi]
+            path, cost = viterbi(unary, pair)
+            keep_cost = min(keep_cost, float(unary[:, 0].sum() + pair[np.arange(S - 1), 0, 0].sum()))
+            if best is None or cost < best[1]:
+                best = (ai, cost, path, unary, gi)
+    ai, cost, path, unary, gi = best
     rows = np.arange(S)
     pick = lambda arr: float(arr[rows, path].sum())  # noqa: E731
     keep = lambda arr: float(arr[:, 0].sum())  # noqa: E731
@@ -434,11 +541,15 @@ def rotation_hypotheses(ep: Episode, model: Model, args) -> dict:
                        if (path == j).any()},
             "data": [round(keep(data), 3), round(pick(data), 3)],
             "hand": [round(keep(contact[ai]) * args.w_hand_h, 3), round(pick(contact[ai]) * args.w_hand_h, 3)],
-            "rest": [round(keep(stab) * args.w_rest, 3), round(pick(stab) * args.w_rest, 3)]}
+            "rest": [round(keep(stab) * args.w_rest, 3), round(pick(stab) * args.w_rest, 3)],
+            "z_placed": int(placed.sum()), "z": [round(keep(zc), 3), round(pick(zc), 3)],
+            "grasp": [round(min(keep(g) for g in gc), 3), round(pick(gc[gi]), 3)],
+            "grasp_point": G[gi].round(3).tolist()}
     turn0 = np.degrees(np.arccos(np.clip((np.einsum("skij,sij->sk", Rn, Rn[:, 0]) - 1) / 2, -1, 1)))
     info["per_state"] = {f"q{q}{'m' if m else ''}": {  # whole-episode sums if the state were kept throughout
         "data": round(float(data[:, j].sum()), 2), "hand": round(float(contact[ai][:, j].sum() * args.w_hand_h), 2),
-        "rest": round(float(stab[:, j].sum() * args.w_rest), 2), "deg_from_q0": round(float(turn0[:, j].mean()), 1)}
+        "rest": round(float(stab[:, j].sum() * args.w_rest), 2), "z": round(float(zc[:, j].sum()), 2),
+        "deg_from_q0": round(float(turn0[:, j].mean()), 1)}
         for j, (q, m) in enumerate(states)}
     if not path.any() or keep_cost - cost < args.hyp_min_gain * S:
         return {"changed": False, **info}
@@ -498,6 +609,51 @@ def stage_a(ep: Episode, model: Model, alphas: np.ndarray, args, stride: int = 2
             below = floor_depth(X, ep, args.floor_tol).max(1).values
             out["floor"].append(float(gm(below, 0.05).mean()))
     return {k: np.array(v) for k, v in out.items()}
+
+
+def rest_scale(eps: list[Episode], models: dict, args) -> dict:
+    """--rest-scale: one absolute scale for the object from its static frames (ep.rest), shared by its
+    episodes, instead of stage a's per-episode alpha. At rest the depth map sees the object whole (a pan on a
+    table); held, it sees the background through a thin object, and contact pulls toward wherever the body's
+    hand is, so one alpha per episode traded the rest phase for the held one (pan ep 12: x1.33 put the pan 0.8 m
+    behind the table).
+    Per static frame the pose is re-fitted to the silhouette alone (scale fixed, --rest-steps): the image then
+    fixes depth / scale, and scale = s0 x (depth map under the mask / centroid depth). The silhouette-only
+    re-fit matters: Step 5's track is a compromise between silhouette and depth (pan at rest: rendered ~15%
+    smaller than its mask, held at the depth map), and scaling that track along the ray keeps the compromise.
+    Median over all static frames of all episodes, so an episode whose rest rotation is wrong (ep 13's handle)
+    is outvoted. Scales ep.s0 and ep.t0 in place when there are --rest-min such frames."""
+    sil_args = argparse.Namespace(**{**vars(args), "w_dep": 0.0})
+    ratios, info = [], {}
+    for ep in eps:
+        idx_np = np.flatnonzero(ep.rest)
+        if not len(idx_np):
+            info[str(ep.episode)] = {"rest_frames": 0}
+            continue
+        model = models[ep.episode]
+        idx = torch.as_tensor(idx_np, device=DEV)
+        R0 = torch.as_tensor(ep.R0[idx_np], dtype=torch.float32, device=DEV)
+        t0 = torch.as_tensor(ep.t0[idx_np], dtype=torch.float32, device=DEV)
+        logs = torch.full((len(idx_np),), float(np.log(ep.s0)), device=DEV)
+        R, t, _, _ = optimize(ep.obs, model, idx, R0, t0, logs, sil_args, args.rest_steps, fit_scale=False,
+                              lr=(0.01, 0.005, 0.0))
+        com = model.points.mean(0)
+        z = (ep.s0 * R @ com + t)[:, 2].detach().cpu().numpy()
+        r = ep.s0 * ep.z_map[idx_np] / z  # the scale that puts the silhouette-consistent pose at the depth map
+        ratios.append(r)
+        info[str(ep.episode)] = {"rest_frames": len(idx_np), "scale_m_median": float(np.median(r)),
+                                 "scale_m_p25_p75": np.percentile(r, [25, 75]).round(4).tolist(),
+                                 "init_z_over_sil_z": float(np.median(ep.t0[idx_np][:, 2] / t[:, 2].detach().cpu().numpy()))}
+    count = sum(len(r) for r in ratios)
+    info.update(rest_frames=count, used=count >= args.rest_min)
+    if not info["used"]:
+        return info
+    scale = float(np.median(np.concatenate(ratios)))
+    info.update(scale_m=scale)
+    for ep in eps:
+        a = scale / ep.s0
+        ep.t0, ep.s0 = a * ep.t0, scale
+    return info
 
 
 def choose_alphas(eps: list[Episode], curves: dict[int, dict], grid: np.ndarray, args) -> tuple[dict, dict]:
@@ -624,7 +780,7 @@ def write_episode(ep: Episode, args, R, t, s, alpha, parts, data_frames, before,
     kinds = ep.cand_kind[sc]
     stats = {
         "episode": ep.episode, "init": str(ep.init_dir), "cache": str(ep.cache), "human": str(args.human),
-        "mesh": ep.mesh_path.name, "scale_init_m": round(ep.s0, 4), "alpha": round(alpha, 4), "scale_m": round(s, 4),
+        "mesh": ep.mesh_path.name, "scale_init_m": round(ep.s_in, 4), "alpha": round(alpha, 4), "scale_m": round(s, 4),
         "frames_fitted": len(frames), "contact_frames": int(kinds.any(1).sum()), "scored": int(sc.sum()),
         "contact_kind_frames": {"hand": int(kinds[:, 0].sum()), "foot": int(kinds[:, 1].sum()),
                                 "body_only": int((kinds[:, 2] & ~kinds[:, 0] & ~kinds[:, 1]).sum())},
@@ -668,6 +824,17 @@ def process_object(name: str, episodes: list[int], args, body, parts, budget, sc
     t_load = time.time() - t1
     grid = np.exp(np.linspace(np.log(args.alpha_range[0]), np.log(args.alpha_range[1]), args.alpha_steps))
     models = {ep.episode: Model(ep.mesh, N_REFINE, args.seed) for ep in eps}
+    for ep in eps:  # static frames with object depth: where the depth map sees the object at rest
+        still = ep.mask_still if args.static_from == "mask" else static_frames(ep.R0, ep.t0, args)
+        # with a hand at the mask, not if the depth map lies behind the hand: an object held still in the air
+        # (pan ep 14, 217-323) shows the background through it. One-sided: a pan on the table in front of a
+        # hanging hand (ep 14 start, hand 0.4 m behind it, near in 2D only) is at rest
+        with np.errstate(invalid="ignore"):
+            hand_ok = ~np.isfinite(ep.hand_z) | ~(ep.z_map > ep.hand_z + args.rest_hand_tol)
+        ep.rest = still & np.isfinite(ep.z_map) & hand_ok
+    scale_info = rest_scale(eps, models, args) if args.rest_scale else {"used": False}
+    if args.rest_scale:
+        print(f"object {name}: rest scale {scale_info}", flush=True)
     hyps = {}
     for ep in eps:
         t1 = time.time()
@@ -677,22 +844,24 @@ def process_object(name: str, episodes: list[int], args, body, parts, budget, sc
     curves = {}
     for ep in eps:
         rel = np.exp(np.log(np.median([e.s0 for e in eps])) + np.log(grid)) / ep.s0  # common absolute grid
-        curves[ep.episode] = stage_a(ep, models[ep.episode], rel, args) if args.stage_a else None
-    if args.stage_a:
+        curves[ep.episode] = stage_a(ep, models[ep.episode], rel, args) if args.stage_a and not scale_info["used"] else None
+    if args.stage_a and not scale_info["used"]:
         alphas, info = choose_alphas(eps, curves, grid, args)
     else:
         alphas, info = {ep.episode: 1.0 for ep in eps}, {}
     info["object"] = name
+    info["rest_scale"] = scale_info
     (args.run / "joint_meta" / f"object_{name}.json").write_text(json.dumps(info))
     stats = []
     for ep in eps:
         t1 = time.time()
         model = models[ep.episode]
-        before = contact_report(ep, ep.R_in, ep.t_in, ep.s0, model, args)
+        before = contact_report(ep, ep.R_in, ep.t_in, ep.s_in, model, args)
         R, t, s, parts_, data_frames = refine(ep, model, alphas[ep.episode], args)
         after = contact_report(ep, R, t, s, model, args)
         st = write_episode(ep, args, R, t, s, alphas[ep.episode], parts_, data_frames, before, after,
                            {"object": name, "object_episodes": episodes, "rotation_hypotheses": hyps[ep.episode],
+                            "rest_frames": int(ep.rest.sum()), "depth_gated_frames": ep.gated,
                             "timing_s": {"load_all": round(t_load, 1), "fit": round(time.time() - t1, 1)}})
         stats.append(st)
         print(f"ep {ep.episode:2d} {name}: alpha {st['alpha']:.3f} (scale {ep.s0:.3f} -> {s:.3f} m), k_t "
@@ -719,6 +888,25 @@ def main():
     parser.add_argument("--lam-k", type=float, default=100.0, help="Whittaker lambda on log k_t")
     # 1. contact candidates
     parser.add_argument("--contact-px", type=float, default=4.0, help="half-resolution px from the object mask")
+    parser.add_argument("--depth-gate", type=float, default=0.0,
+                        help="m; 0: off. With a hand at the object mask, object depth farther than the hand + this "
+                             "is dropped (background through a thin held object: pan 4-6 m with the actor at 3 m)")
+    parser.add_argument("--rest-scale", action="store_true",
+                        help="scale from the static frames' depth, shared by the object's episodes (rest_scale), "
+                             "no per-episode alpha search when it has --rest-min such frames")
+    parser.add_argument("--rest-min", type=int, default=20, help="static depth frames over the object's episodes")
+    parser.add_argument("--rest-steps", type=int, default=100, help="silhouette-only re-fit steps per static frame")
+    parser.add_argument("--static-from", choices=["track", "mask"], default="track",
+                        help="rest frames for --rest-scale / --w-zrest: the init track still (static_frames) or the "
+                             "object mask still (mask_static)")
+    parser.add_argument("--static-px", type=float, default=0.5, help="half-res px/frame (mask_static)")
+    parser.add_argument("--occ-depth", type=float, default=0.0,
+                        help="m; 0: off. The actor mask may hide the object only where the object is not more than "
+                             "this in front of the depth map (object_fit.data_loss)")
+    parser.add_argument("--hyp-tilt", action="store_true",
+                        help="stage 1b also tries the states tilted +-90 deg about the long axis (a disk face-on vs flat)")
+    parser.add_argument("--rest-hand-tol", type=float, default=0.25,
+                        help="m; a still frame with a hand at the mask is not rest if the depth map is this far behind the hand")
     # 1b. rotation hypotheses
     parser.add_argument("--no-rot-hyps", dest="rot_hyps", action="store_false")
     parser.add_argument("--hyp-stride", type=int, default=3)
@@ -729,6 +917,15 @@ def main():
     parser.add_argument("--w-hand-h", type=float, default=0.0,
                         help="per frame, x min(hand distance / 10 cm, 3); off: at one depth per episode the distance is mostly depth error (pan: every state 10 cm off), and it flipped hoop ep 2 / foam roll ep 21 to worse silhouettes")
     parser.add_argument("--w-rest", type=float, default=1.0, help="per static unheld frame, x support_cost")
+    parser.add_argument("--w-zrest", type=float, default=0.0,
+                        help="static frames with object depth: states start at the depth map's depth; x min(|log z "
+                             "drift| / 5%%, 3) (0: off)")
+    parser.add_argument("--w-zhand", type=float, default=0.0,
+                        help="other frames with a hand at the mask: states start at the hand's depth; same cost (0: off)")
+    parser.add_argument("--w-grasp", type=float, default=0.0,
+                        help="frames with a hand at the mask: one grasp point for the episode (of --grasp-points), x its "
+                             "2D distance to the hand / object size, max 2 (0: off)")
+    parser.add_argument("--grasp-points", type=int, default=12)
     parser.add_argument("--w-low", type=float, default=0.1, help="centre height in support_cost (a tie-break)")
     parser.add_argument("--support-tol", type=float, default=0.1,
                         help="x object size: points this close to the lowest support it (0.03 read a flat pan tilted 5 deg as unstable)")
@@ -786,6 +983,8 @@ def main():
     parser.add_argument("--acc-t", type=float, default=0.005)
     parser.add_argument("--acc-r", type=float, default=0.02)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--per-episode", action="store_true",
+                        help="each requested episode alone instead of all episodes of its object")
     args = parser.parse_args()
 
     alt = {}
@@ -802,11 +1001,14 @@ def main():
     meta = args.run / "joint_meta"
     meta.mkdir(parents=True, exist_ok=True)
     (args.run / "args.json").write_text(json.dumps({k: str(v) for k, v in vars(args).items() if k != "sources"}, indent=1))
-    names = object_names(args.data)
-    groups = {}
-    for e in range(30):
-        groups.setdefault(names[e], []).append(e)
     wanted = set(parse_episodes(args.episodes))
+    groups = {}
+    if args.per_episode:
+        groups = {f"episode_{e:06d}": [e] for e in sorted(wanted)}
+    else:
+        names = object_names(args.data)
+        for e in range(30):
+            groups.setdefault(names[e], []).append(e)
     for name, episodes in groups.items():
         if not wanted & set(episodes):
             continue

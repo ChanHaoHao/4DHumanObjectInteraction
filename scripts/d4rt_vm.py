@@ -4,7 +4,8 @@ MoGe-2's metric scale, written as a drop-in replacement for the Step 3v1 cache.
 
     python d4rt_vm.py --episodes 0 [--repo /content/Open-d4rt] [--ckpt-dir DIR] [--data /content/v2d/track_1]
         [--cache /content/repo/cache] [--out /content/repo/cache/d4rt] [--grid 288x384] [--overlap 16]
-        [--chunk 16384] [--no-stabilize] [--fp32] [--max-windows N]
+        [--chunk 16384] [--no-stabilize] [--fp32] [--max-windows N] [--tiles 2 --tile-overlap 0.125]
+        [--video [CACHE ...]]
 
 Per episode:
 1. Frames are resized to 256x256 (the model input, with the 4:3 aspect token) and cut into sliding windows
@@ -20,6 +21,15 @@ Per episode:
    people/objects masked). B is pixel-aligned with the D4RT queries, so no feature matching is needed.
    Overlapping frames are blended with linear ramps. Then, as in Step 3v1, each frame is rescaled by the
    median ratio to B on its static pixels (--no-stabilize skips this; its std is reported either way).
+Tiles (--tiles N): the frame is cut into NxN tiles, each 1+--tile-overlap times W/N by H/N (still 4:3, so the same
+aspect token), and each tile is a separate D4RT run at 256x256 (2x the pixels per object for N=2). Only z is kept:
+every tile cell is a cell of the full-frame grid, so x, y follow from the Step 3v1 K and the tiles share one camera.
+Per window, each tile gets its own scale to the background (step 4); then tiles are placed most-static-pixels first
+and a tile whose median ratio to the already placed tiles on the overlap cells (all cells, people included) is off
+by more than --seam-tol is rescaled to them. Blend: confidence x a linear ramp to 0 at interior tile edges across the
+overlap band. The camera check and the intrinsics estimate (3.) run only without tiles.
+--video [CACHE ...]: <out>/check/episode_XXXXXX_depth.mp4, 2x2 panels RGB | Step 3v1 MoGe | each CACHE | this run,
+one colour range per episode (MoGe's 2-98 percentiles).
 5. Writes <out>/episode_XXXXXX/{masks.npz (copy), depth.npz, camera.npz (Step 3v1 K, which Steps 4-5
    were fit with), meta.json} and <out>/check/episode_XXXXXX.jpg (RGB | MoGe | D4RT | |rel diff| 0-20%).
    depth.npz also has `confidence` [T,h,w]. Inputs per episode: the Step 3v1 masks.npz, camera.npz, meta.json and
@@ -59,17 +69,41 @@ def video_path(data: Path, episode: int) -> Path:
     return data / "videos/chunk-000/observation.images.exo_camera" / f"episode_{episode:06d}.mp4"
 
 
-def read_frames(path: Path) -> np.ndarray:
-    """Every frame resized to the model input, [T,256,256,3] uint8 RGB."""
+def read_frames(path: Path, boxes: list[tuple[int, int, int, int]]) -> list[np.ndarray]:
+    """Every frame cut to each (x0, y0, w, h) box and resized to the model input: per box [T,256,256,3] uint8 RGB."""
     cap = cv2.VideoCapture(str(path))
-    frames = []
+    frames = [[] for _ in boxes]
     while True:
         ok, bgr = cap.read()
         if not ok:
             break
-        frames.append(cv2.resize(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), MODEL_HW[::-1], interpolation=cv2.INTER_AREA))
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        for out, (x0, y0, w, h) in zip(frames, boxes):
+            out.append(cv2.resize(rgb[y0:y0 + h, x0:x0 + w], MODEL_HW[::-1], interpolation=cv2.INTER_AREA))
     cap.release()
-    return np.stack(frames)
+    return [np.stack(f) for f in frames]
+
+
+def tile_boxes(n: int, overlap: float, step: int) -> list[tuple[int, int, int, int]]:
+    """NxN boxes (x0, y0, w, h), each (1 + overlap) / N of the image per side, on the --grid cell raster (step px)."""
+    W, H = IMAGE_SIZE
+    if n == 1:
+        return [(0, 0, W, H)]
+    tw, th = (round(L / n * (1 + overlap) / step) * step for L in (W, H))
+    xs = np.linspace(0, W - tw, n).round().astype(int) // step * step
+    ys = np.linspace(0, H - th, n).round().astype(int) // step * step
+    return [(int(x), int(y), tw, th) for y in ys for x in xs]
+
+
+def edge_ramp(n: int, lo_inner: bool, hi_inner: bool, band: float) -> np.ndarray:
+    """Weight of n cells along one tile axis: 1, falling linearly to 0 over `band` cells at edges inside the image."""
+    i = np.arange(n) + 0.5
+    w = np.ones(n)
+    if lo_inner:
+        w = np.minimum(w, i / band)
+    if hi_inner:
+        w = np.minimum(w, (n - i) / band)
+    return np.clip(w, 1e-3, 1.0)
 
 
 def read_full(path: Path, wanted: list[int]) -> dict[int, np.ndarray]:
@@ -246,8 +280,11 @@ def run_episode(model, clip: int, episode: int, args) -> None:
     gh, gw = args.grid
     step_x, step_y = IMAGE_SIZE[0] / gw, IMAGE_SIZE[1] / gh
 
-    frames = read_frames(video_path(args.data, episode))
-    n = len(frames)
+    assert IMAGE_SIZE[0] / gw == IMAGE_SIZE[1] / gh, "tiles assume square grid cells"
+    boxes = tile_boxes(args.tiles, args.tile_overlap, int(step_x))
+    tiled = len(boxes) > 1
+    tile_frames = read_frames(video_path(args.data, episode), boxes)
+    n = len(tile_frames[0])
     meta = json.loads((src / "meta.json").read_text())
     mz = np.load(src / "masks.npz")
     if (src / "depth.npz").exists():
@@ -274,12 +311,24 @@ def run_episode(model, clip: int, episode: int, args) -> None:
     ys = (np.arange(gh) + 0.5) * step_y - 0.5
     gu, gv = np.meshgrid(xs / (IMAGE_SIZE[0] - 1), ys / (IMAGE_SIZE[1] - 1))
     gu, gv = torch.tensor(gu.ravel(), device=device, dtype=torch.float32), torch.tensor(gv.ravel(), device=device, dtype=torch.float32)
+    tiles = []  # per box: cell slices, queries (u, v in the tile, align_corners), blend ramp
+    for x0, y0, w, h in boxes:
+        c0, c1 = int(x0 // step_x), int((x0 + w) // step_x)
+        r0, r1 = int(y0 // step_y), int((y0 + h) // step_y)
+        tu, tv = np.meshgrid((xs[c0:c1] - x0) / (w - 1), (ys[r0:r1] - y0) / (h - 1))
+        n1 = max(args.tiles - 1, 1)  # overlap band = tile side - stride between tiles
+        band_x, band_y = (w - (IMAGE_SIZE[0] - w) / n1) / step_x, (h - (IMAGE_SIZE[1] - h) / n1) / step_y
+        ramp2 = (edge_ramp(r1 - r0, r0 > 0, r1 < gh, band_y)[:, None] * edge_ramp(c1 - c0, c0 > 0, c1 < gw, band_x)[None])
+        tiles.append({"rs": slice(r0, r1), "cs": slice(c0, c1), "shape": (r1 - r0, c1 - c0), "ramp": ramp2.astype(np.float32),
+                      "u": torch.tensor(tu.ravel(), device=device, dtype=torch.float32),
+                      "v": torch.tensor(tv.ravel(), device=device, dtype=torch.float32)})
+    if not tiled:
+        tiles[0]["u"], tiles[0]["v"] = gu, gv
     cxs = np.linspace(0.05, 0.95, CAM_GRID)
     cu, cv = np.meshgrid(cxs, cxs)
     cu, cv = torch.tensor(cu.ravel(), device=device, dtype=torch.float32), torch.tensor(cv.ravel(), device=device, dtype=torch.float32)
     cam_cells = (np.clip((cv.cpu().numpy() * (IMAGE_SIZE[1] - 1) + 0.5) / step_y, 0, gh - 1).astype(int),
                  np.clip((cu.cpu().numpy() * (IMAGE_SIZE[0] - 1) + 0.5) / step_x, 0, gw - 1).astype(int))
-    q = gh * gw
     aspect = torch.tensor([[IMAGE_SIZE[0] / IMAGE_SIZE[1]]], device=device, dtype=torch.float32)
     amp = not args.fp32
 
@@ -293,64 +342,100 @@ def run_episode(model, clip: int, episode: int, args) -> None:
     for wi, (a, b) in enumerate(wins):
         tw = time.time()
         k = b - a
-        video = torch.from_numpy(frames[a:b]).to(device).permute(0, 3, 1, 2)[None].float() / 255.0
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
-            memory = model.encode_video(video=video, aspect_ratio=aspect)
-        t_local = torch.arange(k, device=device).repeat_interleave(q)
-        xyz, conf = decode(model, video, memory, gu.repeat(k), gv.repeat(k), t_local, t_local, t_local, args.chunk, amp)
-        xyz = xyz.view(k, gh, gw, 3).cpu().numpy()
-        z = xyz[..., 2]
-        conf = conf.view(k, gh, gw).cpu().numpy()
+        rots, trans, scales, placed = [], [], [], []
+        for ti, tile in enumerate(tiles):
+            video = torch.from_numpy(tile_frames[ti][a:b]).to(device).permute(0, 3, 1, 2)[None].float() / 255.0
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+                memory = model.encode_video(video=video, aspect_ratio=aspect)
+            q = len(tile["u"])
+            t_local = torch.arange(k, device=device).repeat_interleave(q)
+            xyz, conf = decode(model, video, memory, tile["u"].repeat(k), tile["v"].repeat(k), t_local, t_local, t_local,
+                               args.chunk, amp)
+            xyz = xyz.view(k, *tile["shape"], 3).cpu().numpy()
+            z = xyz[..., 2]
+            conf = conf.view(k, *tile["shape"]).cpu().numpy()
 
-        # camera t -> window start, on static grid points
-        tc = torch.arange(k, device=device).repeat_interleave(len(cu))
-        loc, _ = decode(model, video, memory, cu.repeat(k), cv.repeat(k), tc, tc, tc, args.chunk, amp)
-        ref, _ = decode(model, video, memory, cu.repeat(k), cv.repeat(k), tc, tc, torch.zeros_like(tc), args.chunk, amp)
-        loc, ref = loc.view(k, -1, 3).cpu().numpy(), ref.view(k, -1, 3).cpu().numpy()
-        rots, trans, scales = [], [], []
-        for i in range(1, k):
-            static = ~dynamic(a + i)[cam_cells]
-            fit = sim3(loc[i][static], ref[i][static])
-            if fit is None:
-                continue
-            s, R, tr = fit
-            rots.append(math.degrees(math.acos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
-            trans.append(float(np.linalg.norm(tr) / np.median(loc[i][static, 2])))
-            scales.append(s)
+            if not tiled:
+                # camera t -> window start, on static grid points
+                tc = torch.arange(k, device=device).repeat_interleave(len(cu))
+                loc, _ = decode(model, video, memory, cu.repeat(k), cv.repeat(k), tc, tc, tc, args.chunk, amp)
+                ref, _ = decode(model, video, memory, cu.repeat(k), cv.repeat(k), tc, tc, torch.zeros_like(tc), args.chunk, amp)
+                loc, ref = loc.view(k, -1, 3).cpu().numpy(), ref.view(k, -1, 3).cpu().numpy()
+                for i in range(1, k):
+                    static = ~dynamic(a + i)[cam_cells]
+                    fit = sim3(loc[i][static], ref[i][static])
+                    if fit is None:
+                        continue
+                    s, R, tr = fit
+                    rots.append(math.degrees(math.acos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
+                    trans.append(float(np.linalg.norm(tr) / np.median(loc[i][static, 2])))
+                    scales.append(s)
 
-        # intrinsics from local points (pixels at full resolution, principal point at the centre)
-        sub = xyz[::4, ::4, ::4].reshape(-1, 3)
-        uu = np.broadcast_to(xs[None, None, ::4], z[::4, ::4, ::4].shape).ravel()
-        vv = np.broadcast_to(ys[None, ::4, None], z[::4, ::4, ::4].shape).ravel()
-        cx, cy = (IMAGE_SIZE[0] - 1) / 2, (IMAGE_SIZE[1] - 1) / 2
-        okx = (np.abs(uu - cx) > 150) & (sub[:, 2] > 0)
-        oky = (np.abs(vv - cy) > 150) & (sub[:, 2] > 0)
-        fx_all.append(np.median(sub[okx, 2] * np.abs(uu[okx] - cx) / np.maximum(np.abs(sub[okx, 0]), 1e-6)))
-        fy_all.append(np.median(sub[oky, 2] * np.abs(vv[oky] - cy) / np.maximum(np.abs(sub[oky, 1]), 1e-6)))
+                # intrinsics from local points (pixels at full resolution, principal point at the centre)
+                sub = xyz[::4, ::4, ::4].reshape(-1, 3)
+                uu = np.broadcast_to(xs[None, None, ::4], z[::4, ::4, ::4].shape).ravel()
+                vv = np.broadcast_to(ys[None, ::4, None], z[::4, ::4, ::4].shape).ravel()
+                cx, cy = (IMAGE_SIZE[0] - 1) / 2, (IMAGE_SIZE[1] - 1) / 2
+                okx = (np.abs(uu - cx) > 150) & (sub[:, 2] > 0)
+                oky = (np.abs(vv - cy) > 150) & (sub[:, 2] > 0)
+                fx_all.append(np.median(sub[okx, 2] * np.abs(uu[okx] - cx) / np.maximum(np.abs(sub[okx, 0]), 1e-6)))
+                fy_all.append(np.median(sub[oky, 2] * np.abs(vv[oky] - cy) / np.maximum(np.abs(sub[oky, 1]), 1e-6)))
 
-        # window scale against the MoGe background on static pixels
-        ratios = []
-        for i in range(0, k, 2):
-            ok = ~dynamic(a + i) & (background > 0) & (z[i] > 0)
-            ratios.append((background[ok] / z[i][ok])[::3])
-        s_w = robust_scale(np.concatenate(ratios))
-        if not np.isfinite(s_w):
-            raise RuntimeError(f"ep {episode} window {a}-{b}: no static pixels for the scale")
+            # tile/window scale against the MoGe background on static pixels
+            bg = background[tile["rs"], tile["cs"]]
+            ratios = []
+            for i in range(0, k, 2):
+                ok = ~dynamic(a + i)[tile["rs"], tile["cs"]] & (bg > 0) & (z[i] > 0)
+                ratios.append((bg[ok] / z[i][ok])[::3])
+            ratios = np.concatenate(ratios)
+            placed.append((ti, robust_scale(ratios), z, conf, len(ratios)))
+            del video, memory
+
+        # place the tiles, best anchored first; rescale a tile that disagrees with the placed ones on the overlap
+        num = np.zeros((k, gh, gw), np.float32)
+        den = np.zeros((k, gh, gw), np.float32)
+        cnum = np.zeros((k, gh, gw), np.float32)
+        tile_stats = []
+        for ti, s_t, z, conf, n_static in sorted(placed, key=lambda p: -p[4]):
+            tile = tiles[ti]
+            rs, cs = tile["rs"], tile["cs"]
+            base = s_t if np.isfinite(s_t) else 1.0
+            ov = (den[:, rs, cs] > 0) & (z > 0)
+            seam = None
+            if ov.sum() >= 50:
+                blend = num[:, rs, cs][ov] / den[:, rs, cs][ov]
+                r = robust_scale((blend / (base * z[ov]))[::5])
+                if np.isfinite(r):
+                    seam = round(abs(math.log(r)), 4)
+                    if not np.isfinite(s_t) or seam > args.seam_tol:
+                        base *= r
+            elif not np.isfinite(s_t):
+                raise RuntimeError(f"ep {episode} window {a}-{b} tile {ti}: no static pixels and no overlap")
+            wgt = tile["ramp"][None] * np.maximum(conf, 1e-3)
+            num[:, rs, cs] += wgt * base * z
+            den[:, rs, cs] += wgt
+            cnum[:, rs, cs] += wgt * conf
+            tile_stats.append({"tile": ti, "scale_bg": round(s_t, 5) if np.isfinite(s_t) else None,
+                               "scale": round(base, 5), "static_px": n_static, "seam_logratio": seam})
+        z_win = np.where(den > 0, num / np.maximum(den, 1e-12), 0)
+        conf_win = np.where(den > 0, cnum / np.maximum(den, 1e-12), 0)
+        s_w = float(np.median([t["scale"] for t in tile_stats]))
         w = ramp(a, b, n if not args.max_windows else wins[-1][1], args.overlap)
-        acc[a:b] += (w[:, None, None] * s_w * z).astype(np.float32)
-        conf_acc[a:b] += (w[:, None, None] * conf).astype(np.float32)
+        acc[a:b] += (w[:, None, None] * z_win).astype(np.float32)
+        conf_acc[a:b] += (w[:, None, None] * conf_win).astype(np.float32)
         wsum[a:b] += w
         win_stats.append({"start": a, "end": b, "scale": round(s_w, 5),
                           "cam_rot_deg_max": round(max(rots), 3) if rots else None,
                           "cam_trans_rel_max": round(max(trans), 4) if trans else None,
                           "cam_scale_dev_max": round(max(abs(s - 1) for s in scales), 4) if scales else None,
-                          "conf_median": round(float(np.median(conf)), 4),
+                          "conf_median": round(float(np.median(conf_win)), 4),
+                          "tiles": tile_stats if tiled else None,
                           "rots": rots, "trans": trans, "scales": scales})
         dt = time.time() - tw
+        seams = [t["seam_logratio"] for t in tile_stats if t["seam_logratio"] is not None]
         print(f"ep {episode} window {wi + 1}/{len(wins)} [{a},{b}) {dt:.1f}s scale {s_w:.4f} "
               f"rot max {win_stats[-1]['cam_rot_deg_max']} trans max {win_stats[-1]['cam_trans_rel_max']} "
-              f"ETA {dt * (len(wins) - wi - 1) / 60:.1f} min", flush=True)
-        del video, memory
+              + (f"seams {seams} " if tiled else "") + f"ETA {dt * (len(wins) - wi - 1) / 60:.1f} min", flush=True)
 
     end = wins[-1][1]
     covered = wsum[:end] > 0
@@ -394,9 +479,10 @@ def run_episode(model, clip: int, episode: int, args) -> None:
     rots = [r for s in win_stats for r in s.pop("rots")]
     trans = [t for s in win_stats for t in s.pop("trans")]
     scl = [abs(c - 1) for s in win_stats for c in s.pop("scales")]
-    fx, fy = float(np.median(fx_all)), float(np.median(fy_all))
+    fx, fy = (float(np.median(v)) if v else math.nan for v in (fx_all, fy_all))
     diag = {
         "checkpoint": args.ckpt_dir.name, "grid": [gh, gw], "clip": clip, "overlap": args.overlap,
+        "tiles": args.tiles, "tile_overlap": args.tile_overlap if tiled else None, "seam_tol": args.seam_tol if tiled else None,
         "stabilized": not args.no_stabilize, "bf16": amp, "frames": end, "windows": win_stats,
         "depth_scale_std": round(float(np.std(corr)), 4),
         "depth_scale_p5_p95": np.round(np.percentile(corr, [5, 95]), 4).tolist(),
@@ -460,6 +546,43 @@ def run_episode(model, clip: int, episode: int, args) -> None:
     print(f"ep {episode}: wrote {dst} in {time.time() - t0:.0f}s", flush=True)
 
 
+def depth_video(args, episode: int, compare: list[Path]):
+    """RGB | MoGe | compare caches | this run, 2x2 (or 2xN) panels at the cache grid, H.264 via ffmpeg."""
+    import subprocess
+
+    name = f"episode_{episode:06d}"
+    panels = [("MoGe (3v1)", args.cache / name / "depth.npz")] + [(c.name, c / name / "depth.npz") for c in compare]
+    panels.append((args.out.name + (f" {args.tiles}x{args.tiles} tiles" if args.tiles > 1 else ""), args.out / name / "depth.npz"))
+    depths = [(label, np.load(p)["depth"]) for label, p in panels if p.exists()]
+    gh, gw = depths[-1][1].shape[1:]
+    ref = depths[0][1]
+    lo, hi = np.percentile(ref[ref > 0][::97].astype(np.float32), [2, 98])
+    T = min(len(d) for _, d in depths)
+    cols = 2
+    rows = (len(depths) + 1 + cols - 1) // cols
+    out = args.out / "check" / f"{name}_depth.mp4"
+    ff = subprocess.Popen(["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s",
+                           f"{cols * gw}x{rows * gh}", "-r", "30", "-i", "-", "-c:v", "libx264", "-crf", "20",
+                           "-pix_fmt", "yuv420p", str(out)], stdin=subprocess.PIPE)
+    cap = cv2.VideoCapture(str(video_path(args.data, episode)))
+    for f in range(T):
+        ok, bgr = cap.read()
+        if not ok:
+            break
+        tiles = [("RGB", cv2.resize(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), (gw, gh), interpolation=cv2.INTER_AREA))]
+        tiles += [(label, np.ascontiguousarray(colorize(d[f].astype(np.float32), lo, hi))) for label, d in depths]
+        tiles += [("", np.zeros((gh, gw, 3), np.uint8))] * (rows * cols - len(tiles))
+        for label, img in tiles:
+            cv2.putText(img, f"{label} f{f}" if label else "", (6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+        grid = np.concatenate([np.concatenate([t[1] for t in tiles[r * cols:(r + 1) * cols]], 1) for r in range(rows)], 0)
+        ff.stdin.write(np.ascontiguousarray(grid).tobytes())
+    cap.release()
+    ff.stdin.close()
+    if ff.wait() != 0:
+        raise RuntimeError("ffmpeg failed")
+    print(f"ep {episode}: wrote {out} ({lo:.2f}-{hi:.2f} m)", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--episodes", default="0")
@@ -474,6 +597,10 @@ def main():
     parser.add_argument("--no-stabilize", action="store_true", help="skip the per-frame background rescale")
     parser.add_argument("--fp32", action="store_true", help="no bf16 autocast")
     parser.add_argument("--max-windows", type=int, default=0, help="probe: only the first N windows, no cache")
+    parser.add_argument("--tiles", type=int, default=1, help="NxN tiles, one D4RT run each (see Tiles above)")
+    parser.add_argument("--tile-overlap", type=float, default=0.125)
+    parser.add_argument("--seam-tol", type=float, default=0.02, help="|log ratio| on a tile overlap that triggers a rescale")
+    parser.add_argument("--video", type=Path, nargs="*", help="render the depth video; optional caches to compare")
     args = parser.parse_args()
     args.grid = tuple(int(x) for x in args.grid.lower().split("x"))
     episodes = []
@@ -484,6 +611,8 @@ def main():
     for e in episodes:
         run_episode(model, clip, e, args)
         torch.cuda.empty_cache()
+        if args.video is not None:
+            depth_video(args, e, args.video)
 
 
 if __name__ == "__main__":

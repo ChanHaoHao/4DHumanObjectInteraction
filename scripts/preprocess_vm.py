@@ -4,6 +4,7 @@
     python preprocess_vm.py --stage sam   [--episodes 0-29] [--data /content/v2d/track_1] [--out /content/raw]
     python preprocess_vm.py --stage depth [--episodes 0-29] ...
     python preprocess_vm.py --stage sam --episodes 9 --object-prompt "table"   # extra object candidates
+    python preprocess_vm.py --stage sam --episodes 0 --object-name "hula hoop"   # prompt from outside (e2e)
     python preprocess_vm.py --stage fallback --episodes 9   # point-prompted track from the depth foreground
 
 Writes, per episode, into <out>/episode_XXXXXX/ (skipped when present, so reruns resume):
@@ -136,7 +137,8 @@ def stage_sam(args, episodes, meta):
         folder.mkdir(parents=True, exist_ok=True)
         video = video_path(args.data, episode)
         n = frame_count(video)
-        jobs = [("person", "person"), ("object", OBJECT_PROMPTS[meta[episode]["object"]])]
+        prompt = args.object_name or OBJECT_PROMPTS[meta[episode]["object"]]
+        jobs = [("person", "person"), ("object", prompt)]
         if args.object_prompt:  # extra candidates for build_cache, which pools every sam_object*.npz
             jobs = [("object_" + args.object_prompt.replace(" ", "_"), args.object_prompt)]
         for name, prompt in jobs:
@@ -313,6 +315,8 @@ def main():
     parser.add_argument("--offload-state", action="store_true",
                         help="keep SAM's tracking state on the CPU (long clips with many instances; slower)")
     parser.add_argument("--object-prompt", help="also track this text, into sam_object_<text>.npz")
+    parser.add_argument("--object-name", help="object prompt for sam_object.npz instead of OBJECT_PROMPTS "
+                        "(the end-to-end run passes the Gemini answer)")
     args = parser.parse_args()
     token = Path("/content/.hf_token")
     if token.exists():
