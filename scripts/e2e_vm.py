@@ -2,17 +2,21 @@
 """End-to-end Track 1 run on one Colab VM: video + object name -> submission episode. Driven by e2e_colab.py.
 
     python e2e_vm.py --run e2e_v1 --names /content/e2e/names.json [--episodes 0] [--from human]
+        [--only sam,depth,cache,mesh] [--no-fallback]
 
 names.json maps episode -> object name (the Gemini answer); nothing else about the object is used, and every
 episode goes through the same stages with the same settings (no per-object rules; depth: whole-frame D4RT on
 MoGe-2's metric scale):
 
   name    Gemini Flash names the object from the video (missing names only)  gemini_object.py
+  locate  LocateAnything-3B boxes for the name on ~11 keyframes          locate_vm.py --keyframes 10
 
   sam     SAM 3 video tracks for "person" and each named object          preprocess_vm.py --stage sam
   depth   MoGe-2 depth, one FOV per clip                                preprocess_vm.py --stage depth
   cache   actor/object track selection, stabilized depth, floor         build_cache.py
-          + track check (track_check.py): no object, coverage < 0.5 or a still track (furniture the hand rests
+          box first: SAM 3 tracker tracks from the locate boxes, voted on by the boxes, still ones lose to a moving
+          one (motion_vm.py --stage box, pick()); the winner alone is rebuilt into the cache if it touches the actor.
+          Otherwise the text-prompt cache goes through the track check (track_check.py): no object, coverage < 0.5 or a still track (furniture the hand rests
           on) -> motion candidates (RGB change seeds -> SAM 3 tracker, motion_vm.py --stage change/seed) built
           into a second cache; it replaces the Gemini one only if it passes the same check. Still nothing ->
           the depth-foreground fallback track, then rebuilt. Decision in cache/<ep>/check.json
@@ -38,6 +42,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -52,9 +57,10 @@ SAMPLE = REPO / "data/v2d_submission_kit/data/track_1_sample_submission.parquet"
 RAW, HUMAN_RAW, OBJECT_RAW = Path("/content/raw"), Path("/content/human_raw"), Path("/content/object_raw")
 MOTION, CACHE_MOTION = Path("/content/motion"), Path("/content/cache_motion")
 CACHE_D4RT = Path("/content/cache_d4rt")
+LOCATE, CACHE_BOX = Path("/content/locate"), Path("/content/cache_box")
 STILL, MIN_COVER = 0.85, 0.5  # track check, read off eps 0-29 of e2e_v1 (notes/preprocess.md)
 SAME_OBJECT = 0.35  # motion track this much inside the Gemini track = a moving part of the named object (desk legs)
-STAGES = ["name", "sam", "depth", "cache", "d4rt", "human", "mesh", "object", "push1", "joint", "push2", "eval"]
+STAGES = ["name", "locate", "sam", "depth", "cache", "d4rt", "human", "mesh", "object", "push1", "joint", "push2", "eval"]
 PINS = "python -c \"import torch, torchvision; print(f'torch=={torch.__version__}'); " \
        "print(f'torchvision=={torchvision.__version__}')\" > /content/pins.txt"
 MHR = r"""
@@ -71,6 +77,14 @@ INSTALL = {
 python -c "from huggingface_hub import snapshot_download; snapshot_download('nvidia/video_to_data_challenge', repo_type='dataset', allow_patterns=['track_1/*'], local_dir='/content/v2d')"
 """,
     # sam3 pins numpy<2 and MoGe pulls numpy 2; both run fine on the result (Step 3 setup)
+    # LocateAnything's remote code wants transformers 4.57: kept in its own folder, first on PYTHONPATH for that
+    # stage only (like the mesh stage's Hunyuan pins), so the other stages keep Colab's transformers
+    "locate": r"""
+pip install -q decord lmdb peft
+pip install -q --no-deps --target /content/locate_pkgs transformers==4.57.1 tokenizers==0.22.1 huggingface-hub==0.36.2
+python -c "from huggingface_hub import snapshot_download; snapshot_download('nvidia/LocateAnything-3B')"
+PYTHONPATH=/content/locate_pkgs python -c "import transformers; assert transformers.__version__ == '4.57.1'"
+""",
     "sam": r"""
 cd /content
 [ -d sam3 ] || git clone -q https://github.com/facebookresearch/sam3.git
@@ -119,7 +133,7 @@ for f in ('model.yaml', 'opend4rt.ckpt'):
 pip install -q -c /content/pins.txt trimesh fast_simplification pyarrow pandas scipy numba opencv-python-headless
 """ + MHR,
 }
-NEEDS = {"name": "data", "sam": "sam", "depth": "sam", "cache": "sam", "d4rt": "data", "human": "body", "mesh": "mesh",
+NEEDS = {"name": "data", "locate": "locate", "sam": "sam", "depth": "sam", "cache": "sam", "d4rt": "data", "human": "body", "mesh": "mesh",
          "object": "fit", "push1": "fit", "joint": "fit", "push2": "fit", "eval": "fit"}
 PUSH = "--w-pen 5 --w-dep 0.3"  # Step 7a settings, every episode
 
@@ -176,6 +190,8 @@ class Runner:
         n, r = ep(e), self.res
         return {
             "name": lambda: bool(self.names.get(e)),
+            # a failed episode leaves a marker: the cache stage then keeps the text-prompt path
+            "locate": lambda: any((LOCATE / f"{n}_locate{x}").exists() for x in (".npz", ".failed")),
             "sam": lambda: all((RAW / n / f).exists() for f in ["sam_person.npz", "sam_object.npz"] + [
                 f"sam_object_{x.replace(' ', '_')}.npz" for x in prompt_parts(self.names[e])[1:]]),
             "depth": lambda: (RAW / n / "depth_raw.npz").exists(),
@@ -214,6 +230,17 @@ class Runner:
             with open(self.logs / "name.txt", "a") as log:
                 log.write(f"{ep(e)}: {answer!r} -> {self.names[e]!r}\n")
 
+    def stage_locate(self):
+        LOCATE.mkdir(exist_ok=True)
+        for e in self.todo(lambda e: self.outputs("locate", e)):
+            try:
+                self.sh("locate", f"PYTHONPATH=/content/locate_pkgs python {SCRIPTS}/locate_vm.py --videos "
+                                  f"{DATA}/videos/chunk-000/observation.images.exo_camera --episode {e} "
+                                  f"--phrase {shlex.quote(self.names[e])} --out {LOCATE} --keyframes 10",
+                        cwd=Path("/content/work"))
+            except RuntimeError as err:
+                (LOCATE / f"{ep(e)}_locate.failed").write_text(str(err))
+
     def stage_sam(self):
         """SAM 3 for "person" and each object Gemini named ("table and bowl" -> "table", "bowl"): the first part goes
         to sam_object.npz, the others to sam_object_<part>.npz; build_cache pools them and keeps the track that
@@ -244,6 +271,21 @@ class Runner:
         for e in self.todo(lambda e: (CACHE / ep(e) / "check.json").exists() or not (CACHE / ep(e) / "meta.json").exists()):
             n = ep(e)
             decision = {"gemini": suspect(CACHE / n)}
+            try:
+                decision["box"] = self.box_candidate(e, build)
+            except RuntimeError as err:  # no boxes or no track: the text-prompt path below
+                decision["box"] = str(err)
+            if decision["box"] is None:
+                shutil.rmtree(CACHE / n)
+                shutil.copytree(CACHE_BOX / n, CACHE / n)
+                shutil.copy(self.res / self.run / "cache_check_box" / f"{n}.jpg", check / f"{n}.jpg")
+                decision["used"] = "box"
+                (CACHE / n / "check.json").write_text(json.dumps(decision, indent=1))
+                continue
+            if self.no_fallback:  # the named object's SAM 3 track as is, flagged or not
+                decision["used"] = "gemini"
+                (CACHE / n / "check.json").write_text(json.dumps(decision, indent=1))
+                continue
             if decision["gemini"]:
                 try:
                     decision["motion"] = self.motion_candidate(e, build)
@@ -267,6 +309,26 @@ class Runner:
             decision["used"] = ("motion" if decision.get("motion") is None and decision["gemini"] else
                                 "depth_fallback" if "depth_fallback" in decision else "gemini")
             (CACHE / n / "check.json").write_text(json.dumps(decision, indent=1))
+
+    def box_candidate(self, e: int, build: str) -> str | None:
+        """The box stage's winning track alone, built into CACHE_BOX (the text-prompt cache gives the actor masks its
+        stillness needs); None when it touches the actor, else why not."""
+        n = ep(e)
+        if not (LOCATE / f"{n}_locate.npz").exists():
+            return "no LocateAnything boxes"
+        work = Path("/content/work")  # from /content, `import sam3` would pick up the repo folder
+        work.mkdir(exist_ok=True)
+        self.sh("cache", f"python {SCRIPTS}/motion_vm.py --stage box --episodes {e} --data {DATA} --cache {CACHE} "
+                         f"--locate {LOCATE} --out {MOTION}", cwd=work)
+        import numpy as np
+
+        data = dict(np.load(MOTION / f"{n}_box.npz"))
+        w = int(data["winner"])
+        np.savez_compressed(RAW / n / "box_cand.npz", **{k: v[w:w + 1] if k in ("obj_ids", "probs", "masks") else v
+                                                        for k, v in data.items()})
+        self.sh("cache", f"{build} {e} --out {CACHE_BOX} --objects box_cand.npz "
+                         f"--overlay {self.res / self.run / 'cache_check_box'}")
+        return json.loads((CACHE_BOX / n / "meta.json").read_text()).get("warning")
 
     def motion_candidate(self, e: int, build: str) -> str | None:
         """Name-free candidate cache in CACHE_MOTION; None when it passes the track check, else why not."""
@@ -377,12 +439,14 @@ class Runner:
             self.sh("eval", f"python render_video.py --run {run} --episodes {csv(eps)} --cache {CACHE} --data {DATA} "
                             f"--sample {SAMPLE}")
 
-    def go(self, start: str):
+    def go(self, start: str, only: list[str]):
         os.environ.setdefault("HF_TOKEN", Path("/content/.hf_token").read_text().strip())
         self.status["failed_episodes"] = {}
-        for stage in STAGES[STAGES.index(start):]:  # a rerun's stale "done" would make the driver pull too early
+        stages = [s for s in STAGES[STAGES.index(start):] if not only or s in only]
+        for stage in stages:  # a rerun's stale "done" would make the driver pull too early
             self.status["stages"][stage] = {"state": "pending"}
-        for stage in STAGES[STAGES.index(start):]:
+        self.install("data", stages[0])  # every stage reads the videos; --only may skip the name stage that installs them
+        for stage in stages:
             self.status["stages"][stage] = {"state": "running", "start": time.time(), "episodes": self.episodes}
             self.status["current"] = stage
             self.save()
@@ -452,13 +516,17 @@ def main():
     p.add_argument("--episodes", required=True, help="comma-separated")
     p.add_argument("--from", dest="start", choices=STAGES, default=STAGES[0],
                    help="first stage to (re)check; earlier stages are assumed done")
+    p.add_argument("--only", default="", help="comma-separated stages to run (the rest are assumed done)")
+    p.add_argument("--no-fallback", action="store_true", help="keep the named object's track: no motion/depth fallback")
     p.add_argument("--fallback-args", default="", help='extra preprocess_vm.py fallback flags, e.g. "--fg-gap 0.1"')
     args = p.parse_args()
     names = {int(k): v for k, v in json.loads(args.names.read_text()).items()} if args.names.exists() else {}
     episodes = [int(e) for e in args.episodes.split(",")]
     runner = Runner(args.run, names, episodes, args.names)
-    runner.fallback_args = args.fallback_args
-    runner.go(args.start)
+    runner.fallback_args, runner.no_fallback = args.fallback_args, args.no_fallback
+    only = [x for x in args.only.split(",") if x]
+    assert set(only) <= set(STAGES), f"unknown stages {set(only) - set(STAGES)}"
+    runner.go(args.start, only)
 
 
 if __name__ == "__main__":

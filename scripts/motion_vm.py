@@ -4,6 +4,7 @@
     python motion_vm.py --stage motion --episodes 0,5 [--out DIR] [--grid 144x192] [--stride 2]
     python motion_vm.py --stage seed   --episodes 0,5 [--out DIR]
     python motion_vm.py --stage text   --episodes 0,5 [--out DIR]
+    python motion_vm.py --stage box    --episodes 0,5 [--out DIR] [--locate DIR] [--compare CACHE_DIR]
 
 motion  D4RT predicts, for pixel (u, v) of frame t, where that surface point is at time t' (camera of frame t).
         Every --stride-th frame, a 144x192 grid is queried at t, t +- 6 and t + 20 (t - 20 near the window end);
@@ -23,6 +24,7 @@ seed    Uses the motion and the SAM 3 "person" tracks (cache/raw/<ep>/sam_person
            component best with little person overlap and a sane size; then it is tracked both ways over the clip.
         Writes <out>/<ep>_cand.npz (sam_object*.npz format, one track per seed), <out>/<ep>_seed.json and a check
         image <out>/<ep>_seed.jpg.
+box     LocateAnything keyframe boxes -> SAM 3 tracker tracks voted on by the boxes (see stage_box).
 text    SAM 3 text tracks for the dataset's own metadata fields (no hand-written names): `object` with
         underscores as spaces, and `object_prompt`. Writes <out>/<ep>_text.npz (both pooled; prompt per track).
 """
@@ -397,6 +399,134 @@ def check_image(e: int, info: dict, report: dict, tracks_masks: list, args):
 
 
 # -------------------------------------------------------------------------------------------------- text
+def mask_box(mask: np.ndarray) -> np.ndarray | None:
+    rows, cols = np.flatnonzero(mask.any(1)), np.flatnonzero(mask.any(0))
+    return None if not len(rows) else np.array([cols[0], rows[0], cols[-1] + 1, rows[-1] + 1], float)
+
+
+def iou_xyxy(a, b) -> float:
+    w, h = min(a[2], b[2]) - max(a[0], b[0]), min(a[3], b[3]) - max(a[1], b[1])
+    inter = max(w, 0) * max(h, 0)
+    return inter / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter + 1e-9)
+
+
+def mean_iou(packed: np.ndarray, ref: Path) -> float | None:
+    """Mean IoU of a packed track [n,576,96] vs a cache masks.npz object mask, over frames where either is non-empty."""
+    if not ref.exists():
+        return None
+    r = np.load(ref)
+    ours = np.unpackbits(packed[r["frames"]], axis=-1).astype(bool)
+    theirs = r["object"]
+    union = (ours | theirs).sum((1, 2))
+    on = union > 0
+    return round(float(((ours & theirs).sum((1, 2))[on] / union[on]).mean()), 3) if on.any() else None
+
+
+STILL = 0.85  # same cut as e2e_vm's track check
+
+
+def track_stillness(packed: np.ndarray, ref: Path) -> float:
+    """track_check.stillness of a packed track [n,576,96] on the frames of a cache masks.npz, its actor removed."""
+    from track_check import stillness
+
+    r = np.load(ref)
+    obj = np.unpackbits(packed[r["frames"], ::4], axis=-1)[:, :, ::4].astype(bool)
+    return stillness(obj, r["human"][:, ::4, ::4])[0]
+
+
+def pick(votes, still) -> int:
+    """Most votes, unless that track is still and a moving one has >= 2 votes (the seed's own + one more box):
+    then the moving one with most votes. Tables and monitors win box votes when the object rests on or near them."""
+    votes, still = np.asarray(votes), np.asarray(still, float)
+    best = int(votes.argmax())
+    moving = (still < STILL) & (votes >= 2)
+    if still[best] >= STILL and moving.any():
+        return int(np.where(moving, votes, -1).argmax())
+    return best
+
+
+def stage_box(args, episodes):
+    """LocateAnything keyframe boxes (<locate>/<ep>_locate.npz) -> SAM 3 tracker tracks. A track gets one vote per
+    keyframe box its mask's box overlaps (IoU >= --vote-iou); a box no track explains seeds the next track (up to
+    --seeds, boxes closest to the median box area first). Winner: see pick(). Writes <ep>_box.npz (sam_object*.npz
+    format, all tracks, + votes, winner) and <ep>_box.json, with mean IoU vs <cache>/<ep>/masks.npz and --compare."""
+    import torch
+    from sam3.model_builder import build_sam3_video_model
+
+    model = build_sam3_video_model()
+    tracker = model.tracker
+    tracker.backbone = model.detector.backbone
+    for e in episodes:
+        name = f"episode_{e:06d}"
+        if (args.out / f"{name}_box.npz").exists():
+            continue
+        t0 = time.time()
+        loc = np.load(args.locate / f"{name}_locate.npz")
+        kf, boxes = loc["frames"], loc["boxes"][:, :4]
+        valid = loc["boxes"][:, 4] > 0
+        area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+        order = [int(i) for i in np.argsort(np.abs(np.log(area / np.median(area[valid])))) if valid[i]]
+        video = video_path(args.data, e)
+        cap = cv2.VideoCapture(str(video))
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        state = tracker.init_state(video_path=str(video))
+        explained = ~valid
+        tracks, report = [], []
+        for i in order:
+            if len(tracks) >= args.seeds:
+                break
+            if explained[i]:
+                continue
+            f = int(kf[i])
+            probs = np.zeros(n, np.float16)
+            packed = np.zeros((n, H // MASK_STEP, W // MASK_STEP // 8), np.uint8)
+            at_kf = {}
+            # shortcut: box prompt only, no negative points on the actor; add them if a box around a hoop grabs the person
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                tracker.clear_all_points_in_video(state)
+                add_prompt(tracker, state, f, np.zeros((0, 2)), [], boxes[i])
+                for reverse in (False, True):
+                    for fi, _, _, video_masks, scores in tracker.propagate_in_video(
+                            state, start_frame_idx=f, max_frame_num_to_track=n, reverse=reverse, propagate_preflight=True):
+                        mask = (video_masks[0] > 0).reshape(video_masks.shape[-2:]).cpu().numpy()
+                        if mask.any():
+                            probs[fi] = max(float(torch.sigmoid(torch.as_tensor(scores).float().flatten()[0])), 1e-3)
+                            packed[fi] = np.packbits(mask[::MASK_STEP, ::MASK_STEP], axis=-1)
+                        if fi in kf:
+                            at_kf[int(fi)] = mask_box(mask)
+            ious = [0.0 if at_kf.get(int(t)) is None else iou_xyxy(at_kf[int(t)], b) for t, b in zip(kf, boxes)]
+            votes = valid & (np.array(ious) >= args.vote_iou)
+            votes[i] = True
+            explained |= votes
+            tracks.append((probs, packed))
+            report.append({"seed_frame": f, "seed_box": boxes[i].round(1).tolist(), "votes": int(votes.sum()),
+                           "kf_iou": np.round(ious, 2).tolist(), "frames_tracked": int((probs > 0).sum())})
+            print(f"ep {e} track {len(tracks)}: seed f{f}, votes {int(votes.sum())}/{int(valid.sum())}", flush=True)
+        votes = np.array([r["votes"] for r in report])
+        for r, (_, packed) in zip(report, tracks):
+            r["still"] = round(track_stillness(packed, args.cache / name / "masks.npz"), 3)
+        winner = pick(votes, [r["still"] for r in report])
+        for r, (_, packed) in zip(report, tracks):
+            r["iou_ref"] = mean_iou(packed, args.cache / name / "masks.npz")
+            r["iou_compare"] = mean_iou(packed, args.compare / name / "masks.npz") if args.compare else None
+        out = {"episode": e, "winner": winner, "tracks": report, "seconds": round(time.time() - t0, 1),
+               "compare_vs_ref": None}
+        if args.compare and (args.compare / name / "masks.npz").exists():
+            c = np.load(args.compare / name / "masks.npz")
+            full = np.zeros((n, H // MASK_STEP, W // MASK_STEP // 8), np.uint8)
+            full[c["frames"]] = np.packbits(c["object"], axis=-1)
+            out["compare_vs_ref"] = mean_iou(full, args.cache / name / "masks.npz")
+        save(args.out / f"{name}_box.npz", obj_ids=np.arange(1, len(tracks) + 1), probs=np.stack([t[0] for t in tracks]),
+             masks=np.stack([t[1] for t in tracks]), prompt=" | ".join(f"box: frame {r['seed_frame']}" for r in report),
+             image_size=np.array([W, H]), votes=votes, winner=winner)
+        (args.out / f"{name}_box.json").write_text(json.dumps(out, indent=1))
+        print(f"ep {e} box: winner {winner + 1}, votes {votes.tolist()}, iou_ref "
+              f"{[r['iou_ref'] for r in report]}, compare {out['compare_vs_ref']} ({out['seconds']}s)", flush=True)
+        del state
+        torch.cuda.empty_cache()
+
+
 def stage_text(args, episodes):
     import torch
     from preprocess_vm import run_sam
@@ -433,7 +563,7 @@ def stage_text(args, episodes):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--stage", choices=["motion", "change", "seed", "text"], required=True)
+    parser.add_argument("--stage", choices=["motion", "change", "seed", "text", "box"], required=True)
     parser.add_argument("--episodes", default="0")
     parser.add_argument("--repo", type=Path, default=Path("/content/Open-d4rt"))
     parser.add_argument("--ckpt-dir", type=Path, default=Path("/content/Open-d4rt/checkpoints/OpenD4RT_48CLIP_9Mix_NoCropAUG"))
@@ -448,6 +578,9 @@ def main():
     parser.add_argument("--min-cells", type=int, default=6)
     parser.add_argument("--seeds", type=int, default=3)
     parser.add_argument("--seed-gap", type=int, default=30)
+    parser.add_argument("--locate", type=Path, default=REPO / "results" / "locate", help="box stage: LocateAnything npz dir")
+    parser.add_argument("--compare", type=Path, help="box stage: another cache dir whose object masks are scored too")
+    parser.add_argument("--vote-iou", type=float, default=0.5)
     args = parser.parse_args()
     args.grid = tuple(int(x) for x in args.grid.split("x"))
     args.out.mkdir(parents=True, exist_ok=True)
@@ -463,7 +596,7 @@ def main():
         import torch
 
         with torch.inference_mode():
-            {"seed": stage_seed, "text": stage_text}[args.stage](args, episodes)
+            {"seed": stage_seed, "text": stage_text, "box": stage_box}[args.stage](args, episodes)
 
 
 if __name__ == "__main__":

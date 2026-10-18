@@ -37,9 +37,9 @@ ROOT = Path(__file__).resolve().parents[1]
 VM = "/content/repo"
 SCRIPTS = ["e2e_vm.py", "gemini_object.py", "preprocess_vm.py", "build_cache.py", "human_vm.py", "human_post.py", "object_vm.py",
            "object_fit.py", "pushout.py", "joint_fit.py", "proxy_eval.py", "render_video.py",
-           "track_check.py", "motion_vm.py", "d4rt_vm.py"]
+           "track_check.py", "motion_vm.py", "d4rt_vm.py", "locate_vm.py"]
 VIDEOS = "videos/chunk-000/observation.images.exo_camera"
-STAGES = ["name", "sam", "depth", "cache", "d4rt", "human", "mesh", "object", "push1", "joint", "push2", "eval"]
+STAGES = ["name", "locate", "sam", "depth", "cache", "d4rt", "human", "mesh", "object", "push1", "joint", "push2", "eval"]
 
 
 def known_names(episodes: list[int]) -> dict[int, str]:
@@ -114,14 +114,19 @@ def pull_stage(session: str, run: str, stage: str, episodes: list[int]):
     res = f"{VM}/results"
     if stage == "name":
         merge_answers(session, run)
+    elif stage == "locate":  # boxes, summary json and keyframe overlay per episode
+        pull_dir(session, "/content/locate", dst / "locate", names, force=True)
     elif stage == "cache":
         for n in names:
             pull_dir(session, f"{VM}/cache/{n}", dst / "cache" / n, force=True)
         pull_dir(session, f"{res}/{run}/cache_check", dst / "cache_check", names, force=True)
         if ls(session, f"{res}/{run}/cache_check_motion"):
             pull_dir(session, f"{res}/{run}/cache_check_motion", dst / "cache_check_motion", names, force=True)
-        if ls(session, "/content/motion"):  # motion fallback: seed report + check image per flagged episode
-            pull_dir(session, "/content/motion", dst / "motion", tuple(f"{n}_seed" for n in names), force=True)
+        if ls(session, f"{res}/{run}/cache_check_box"):
+            pull_dir(session, f"{res}/{run}/cache_check_box", dst / "cache_check_box", names, force=True)
+        if ls(session, "/content/motion"):  # box tracks + votes; motion fallback seed report + check image
+            pull_dir(session, "/content/motion", dst / "motion", tuple(f"{n}_{x}" for n in names for x in ("seed", "box")),
+                     force=True)
     elif stage == "d4rt":  # the swapped cache files (depth.npz is now D4RT's)
         for n in names:
             (dst / "cache" / n).mkdir(parents=True, exist_ok=True)
@@ -222,19 +227,25 @@ def main():
             s.add_argument("--from", dest="start", choices=STAGES, default="name")
             s.add_argument("--key-var", default="GEMINI_API_KEY", help=".env.local entry holding the Gemini key")
             s.add_argument("--fallback-args", default="", help="forwarded to e2e_vm.py")
+            s.add_argument("--names", type=Path, help="JSON episode -> object name, used instead of Gemini's answers")
+            s.add_argument("--only", default="", help="forwarded to e2e_vm.py")
+            s.add_argument("--no-fallback", action="store_true", help="forwarded to e2e_vm.py")
     args = p.parse_args()
     if args.cmd == "status":
         print(json.dumps(read_status(args.session, args.run), indent=1))
         return 0
     if args.cmd == "run":
         episodes = parse_episodes(args.episodes)
-        names = known_names(episodes)
+        names = ({e: gemini_object.object_name(v) for e, v in
+                  ((int(k), v) for k, v in json.loads(args.names.read_text()).items()) if e in episodes}
+                 if args.names else known_names(episodes))
         upload(args.session, args.run, episodes, names, args.key_var)
         remote(args.session, f"rm -f /content/logs/e2e_{args.run}.txt")
         launch(args.session, f"e2e_{args.run}",
                f"cd {VM}/scripts && python e2e_vm.py --run {args.run} --names /content/e2e/{args.run}/names.json "
                f"--episodes {','.join(map(str, episodes))} --from {args.start} "
-               f"--fallback-args '{args.fallback_args}'")
+               f"--fallback-args '{args.fallback_args}'" + (f" --only {args.only}" if args.only else "")
+               + (" --no-fallback" if args.no_fallback else ""))
     skip = tuple(STAGES[:STAGES.index(args.start)]) if args.cmd == "run" else ()
     return follow(args.session, args.run, skip=skip)
 

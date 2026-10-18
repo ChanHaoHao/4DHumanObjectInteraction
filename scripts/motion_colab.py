@@ -69,6 +69,9 @@ def setup(session: str, episodes: list[int]):
         n = f"episode_{e:06d}"
         members += [(ROOT / "cache" / n / f, f"cache/{n}/{f}") for f in ("masks.npz", "camera.npz", "meta.json")]
         members.append((ROOT / "cache/raw" / n / "sam_person.npz", f"cache/raw/{n}/sam_person.npz"))
+        # box stage inputs: LocateAnything boxes, and e2e_g2's object masks to score against
+        members += [(f, str(f.relative_to(ROOT))) for f in (ROOT / f"results/locate/{n}_locate.npz",
+                                                            ROOT / f"results/e2e_g2/cache/{n}/masks.npz") if f.exists()]
     upload_tar(session, f"motion_{session}", members, VM)
     print(f"[{session}] uploaded {len(episodes)} episodes", flush=True)
     while "setup_done" not in ls(session, "/content"):
@@ -97,7 +100,8 @@ def pull(session: str, episodes: list[int]):
     have = set(ls(session, OUT))
     for e in episodes:
         n = f"episode_{e:06d}"
-        for f in (f"{n}_cand.npz", f"{n}_text.npz", f"{n}_seed.json", f"{n}_seed.jpg", f"{n}_motion_small.npz"):
+        for f in (f"{n}_cand.npz", f"{n}_text.npz", f"{n}_seed.json", f"{n}_seed.jpg", f"{n}_motion_small.npz",
+                  f"{n}_box.json"):
             if f in have:
                 colab("download", "-s", session, f"{OUT}/{f}", str(dst / f), timeout=1800)
     for f in have:
