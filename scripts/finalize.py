@@ -127,8 +127,8 @@ def process(episode: int, args, body: MHRBody, budget, scored: np.ndarray, hand_
     t = np.asarray(data["object_translation"], np.float64)
     s = float(np.asarray(data["object_scale"]).reshape(-1)[0])
     t = t + s * R @ c
-    mesh = trimesh.load(mesh_path, force="mesh")
-    mesh.apply_translation(-c)
+    loaded = trimesh.load(mesh_path, force="mesh")
+    mesh = trimesh.Trimesh(loaded.vertices - c, loaded.faces, process=False)  # geometry only: a textured OBJ needs PIL to read
     dst.mkdir(parents=True, exist_ok=True)
     out_mesh = dst / f"{name}_object.obj"
     mesh.export(out_mesh)
