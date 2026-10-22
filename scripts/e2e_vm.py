@@ -29,7 +29,7 @@ MoGe-2's metric scale):
   joint   contact / floor / per-frame depth placement (7b/7c)           joint_fit.py --per-episode
   render  (--render only) render-and-compare refinement, no depth        render_fit.py
   push2   push-out again on the placed track (or on render's)           pushout.py --w-pen 5 --w-dep 0.3
-  final   mesh origin at its centroid, smoothed translation, hands out  finalize.py --lam-o 1000
+  final   mesh origin at its centroid, smoothed translation, hands out  finalize.py
   eval    proxy metrics and the overlay | side-view video               proxy_eval.py, render_video.py
 
 Stages whose outputs exist are skipped, so a rerun resumes. Installs happen just before the first stage that needs
@@ -146,7 +146,7 @@ NEEDS = {"name": "data", "locate": "locate", "sam": "sam", "depth": "sam", "cach
          "object": "fit", "push1": "fit", "joint": "fit", "render": "render", "push2": "fit", "final": "fit",
          "eval": "fit"}
 PUSH = "--w-pen 5 --w-dep 0.3"  # Step 7a settings, every episode
-FINAL = "--lam-o 1000"
+FINAL = ""  # finalize.py defaults
 
 
 def ep(e: int) -> str:
