@@ -37,9 +37,9 @@ ROOT = Path(__file__).resolve().parents[1]
 VM = "/content/repo"
 SCRIPTS = ["e2e_vm.py", "gemini_object.py", "preprocess_vm.py", "build_cache.py", "human_vm.py", "human_post.py", "object_vm.py",
            "object_fit.py", "pushout.py", "joint_fit.py", "proxy_eval.py", "render_video.py",
-           "track_check.py", "motion_vm.py", "d4rt_vm.py", "locate_vm.py"]
+           "track_check.py", "motion_vm.py", "d4rt_vm.py", "locate_vm.py", "render_fit.py", "finalize.py"]
 VIDEOS = "videos/chunk-000/observation.images.exo_camera"
-STAGES = ["name", "locate", "sam", "depth", "cache", "d4rt", "human", "mesh", "object", "push1", "joint", "push2", "eval"]
+STAGES = ["name", "locate", "sam", "depth", "cache", "d4rt", "human", "mesh", "object", "push1", "joint", "render", "push2", "final", "eval"]
 
 
 def known_names(episodes: list[int]) -> dict[int, str]:
@@ -138,11 +138,16 @@ def pull_stage(session: str, run: str, stage: str, episodes: list[int]):
     elif stage == "mesh":
         for sub in ("crops", "meshes"):
             pull_dir(session, f"/content/object_raw/{sub}", dst / "object_raw" / sub, names, force=True)
+    elif stage == "render":
+        for sub in ("episodes", "render_meta", "videos"):
+            pull_dir(session, f"{res}/{run}_r/{sub}", dst / "stages/render" / sub, names, force=True)
     elif stage in ("object", "push1", "joint"):
         src = {"object": f"{run}_obj", "push1": f"{run}_p1", "joint": f"{run}_j"}[stage]
         for sub in ("episodes", "object_meta", "joint_meta"):
             pull_dir(session, f"{res}/{src}/{sub}", dst / "stages" / stage / sub, names, force=True)
     elif stage == "push2":
+        pull_dir(session, f"{res}/{run}_p2/episodes", dst / "stages/push2/episodes", names, force=True)
+    elif stage == "final":
         pull_dir(session, f"{res}/{run}/episodes", dst / "episodes", names, force=True)
     elif stage == "eval":
         for f in ("proxy_eval.csv", "proxy_eval.txt"):  # per session: two VMs can share a run
@@ -227,6 +232,9 @@ def main():
             s.add_argument("--from", dest="start", choices=STAGES, default="name")
             s.add_argument("--key-var", default="GEMINI_API_KEY", help=".env.local entry holding the Gemini key")
             s.add_argument("--fallback-args", default="", help="forwarded to e2e_vm.py")
+            s.add_argument("--joint-args", default="", help="forwarded to e2e_vm.py")
+            s.add_argument("--render", action="store_true", help="forwarded to e2e_vm.py")
+            s.add_argument("--render-args", default="", help="forwarded to e2e_vm.py")
             s.add_argument("--names", type=Path, help="JSON episode -> object name, used instead of Gemini's answers")
             s.add_argument("--only", default="", help="forwarded to e2e_vm.py")
             s.add_argument("--no-fallback", action="store_true", help="forwarded to e2e_vm.py")
@@ -244,7 +252,8 @@ def main():
         launch(args.session, f"e2e_{args.run}",
                f"cd {VM}/scripts && python e2e_vm.py --run {args.run} --names /content/e2e/{args.run}/names.json "
                f"--episodes {','.join(map(str, episodes))} --from {args.start} "
-               f"--fallback-args '{args.fallback_args}'" + (f" --only {args.only}" if args.only else "")
+               f"--fallback-args '{args.fallback_args}' --joint-args '{args.joint_args}' "
+               f"--render-args '{args.render_args}'" + (" --render" if args.render else "") + (f" --only {args.only}" if args.only else "")
                + (" --no-fallback" if args.no_fallback else ""))
     skip = tuple(STAGES[:STAGES.index(args.start)]) if args.cmd == "run" else ()
     return follow(args.session, args.run, skip=skip)

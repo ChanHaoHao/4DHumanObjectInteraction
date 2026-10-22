@@ -27,13 +27,15 @@ MoGe-2's metric scale):
   object  mesh choice, scale, pose track (episode fitted alone)         object_fit.py --per-episode
   push1   hand-penetration push-out (7a)                                pushout.py --w-pen 5 --w-dep 0.3
   joint   contact / floor / per-frame depth placement (7b/7c)           joint_fit.py --per-episode
-  push2   push-out again on the placed track                            pushout.py --w-pen 5 --w-dep 0.3
+  render  (--render only) render-and-compare refinement, no depth        render_fit.py
+  push2   push-out again on the placed track (or on render's)           pushout.py --w-pen 5 --w-dep 0.3
+  final   mesh origin at its centroid, smoothed translation, hands out  finalize.py --lam-o 1000
   eval    proxy metrics and the overlay | side-view video               proxy_eval.py, render_video.py
 
 Stages whose outputs exist are skipped, so a rerun resumes. Installs happen just before the first stage that needs
 them (marker /content/installed_<group>). Layout: /content/repo mirrors the repo (scripts, cache, results, kit,
 body_models), videos + meta under /content/v2d/track_1. Runs: results/<run>_human, <run>_obj, <run>_p1, <run>_j,
-<run> (final). Progress: /content/e2e/<run>/status.json, stage logs in /content/e2e/<run>/logs/.
+<run>_p2, <run> (final). Progress: /content/e2e/<run>/status.json, stage logs in /content/e2e/<run>/logs/.
 """
 
 from __future__ import annotations
@@ -60,7 +62,8 @@ CACHE_D4RT = Path("/content/cache_d4rt")
 LOCATE, CACHE_BOX = Path("/content/locate"), Path("/content/cache_box")
 STILL, MIN_COVER = 0.85, 0.5  # track check, read off eps 0-29 of e2e_v1 (notes/preprocess.md)
 SAME_OBJECT = 0.35  # motion track this much inside the Gemini track = a moving part of the named object (desk legs)
-STAGES = ["name", "locate", "sam", "depth", "cache", "d4rt", "human", "mesh", "object", "push1", "joint", "push2", "eval"]
+STAGES = ["name", "locate", "sam", "depth", "cache", "d4rt", "human", "mesh", "object", "push1", "joint", "render", "push2",
+          "final", "eval"]
 PINS = "python -c \"import torch, torchvision; print(f'torch=={torch.__version__}'); " \
        "print(f'torchvision=={torchvision.__version__}')\" > /content/pins.txt"
 MHR = r"""
@@ -132,10 +135,18 @@ for f in ('model.yaml', 'opend4rt.ckpt'):
     "fit": PINS + r"""
 pip install -q -c /content/pins.txt trimesh fast_simplification pyarrow pandas scipy numba opencv-python-headless
 """ + MHR,
+    # nvdiffrast 0.4 builds its CUDA plugin at install (0.3.3 left none: "No module named nvdiffrast_plugin"); no OpenGL
+    "render": PINS + r"""
+pip install -q -c /content/pins.txt trimesh fast_simplification pyarrow pandas scipy numba opencv-python-headless ninja
+pip install -q --no-build-isolation git+https://github.com/NVlabs/nvdiffrast.git@v0.4.0
+python -c "import nvdiffrast.torch as dr, torch; dr.RasterizeCudaContext(); print('nvdiffrast ok')"
+""" + MHR,
 }
 NEEDS = {"name": "data", "locate": "locate", "sam": "sam", "depth": "sam", "cache": "sam", "d4rt": "data", "human": "body", "mesh": "mesh",
-         "object": "fit", "push1": "fit", "joint": "fit", "push2": "fit", "eval": "fit"}
+         "object": "fit", "push1": "fit", "joint": "fit", "render": "render", "push2": "fit", "final": "fit",
+         "eval": "fit"}
 PUSH = "--w-pen 5 --w-dep 0.3"  # Step 7a settings, every episode
+FINAL = "--lam-o 1000"
 
 
 def ep(e: int) -> str:
@@ -202,7 +213,9 @@ class Runner:
             "object": lambda: (r / f"{self.run}_obj/episodes/{n}.npz").exists(),
             "push1": lambda: (r / f"{self.run}_p1/episodes/{n}.npz").exists(),
             "joint": lambda: (r / f"{self.run}_j/episodes/{n}.npz").exists(),
-            "push2": lambda: (r / f"{self.run}/episodes/{n}.npz").exists(),
+            "render": lambda: (r / f"{self.run}_r/render_meta/{n}.json").exists(),
+            "push2": lambda: (r / f"{self.run}_p2/episodes/{n}.npz").exists(),
+            "final": lambda: (r / f"{self.run}/episodes/{n}.npz").exists(),
             "eval": lambda: (r / f"{self.run}/videos/{n}.mp4").exists(),
         }[stage]()
 
@@ -425,10 +438,25 @@ class Runner:
         if eps:
             self.sh("joint", f"python joint_fit.py --human {self.res / self.run}_human/episodes "
                              f"--init {self.res / self.run}_p1/episodes --run {run} --episodes {csv(eps)} "
-                             f"--cache {CACHE} --data {DATA} --sample {SAMPLE} --per-episode")
+                             f"--cache {CACHE} --data {DATA} --sample {SAMPLE} --per-episode {self.joint_args}")
+
+    def stage_render(self):
+        run = self.res / f"{self.run}_r"
+        eps = self.todo(lambda e: self.outputs("render", e))
+        if eps:
+            self.sh("render", f"python render_fit.py --human {self.res / self.run}_human/episodes "
+                              f"--init {self.res / self.run}_j/episodes --run {run} --episodes {csv(eps)} "
+                              f"--cache {CACHE} --data {DATA} --sample {SAMPLE} {self.render_args}")
 
     def stage_push2(self):
-        self.push("push2", f"{self.run}_j", self.run)
+        self.push("push2", f"{self.run}_r" if self.render else f"{self.run}_j", f"{self.run}_p2")
+
+    def stage_final(self):
+        run = self.res / self.run
+        eps = self.todo(lambda e: (run / "episodes" / f"{ep(e)}.npz").exists())
+        if eps:
+            self.sh("final", f"python finalize.py --src {self.res / self.run}_p2/episodes --run {run} "
+                             f"--episodes {csv(eps)} --sample {SAMPLE} {FINAL}")
 
     def stage_eval(self):
         run = self.res / self.run
@@ -442,7 +470,7 @@ class Runner:
     def go(self, start: str, only: list[str]):
         os.environ.setdefault("HF_TOKEN", Path("/content/.hf_token").read_text().strip())
         self.status["failed_episodes"] = {}
-        stages = [s for s in STAGES[STAGES.index(start):] if not only or s in only]
+        stages = [s for s in STAGES[STAGES.index(start):] if (not only or s in only) and (s != "render" or self.render)]
         for stage in stages:  # a rerun's stale "done" would make the driver pull too early
             self.status["stages"][stage] = {"state": "pending"}
         self.install("data", stages[0])  # every stage reads the videos; --only may skip the name stage that installs them
@@ -519,11 +547,16 @@ def main():
     p.add_argument("--only", default="", help="comma-separated stages to run (the rest are assumed done)")
     p.add_argument("--no-fallback", action="store_true", help="keep the named object's track: no motion/depth fallback")
     p.add_argument("--fallback-args", default="", help='extra preprocess_vm.py fallback flags, e.g. "--fg-gap 0.1"')
+    p.add_argument("--joint-args", default="", help='extra joint_fit.py flags, e.g. "--refine full"')
+    p.add_argument("--render", action="store_true", help="run the render stage (render_fit.py) before push2")
+    p.add_argument("--render-args", default="", help="extra render_fit.py flags")
     args = p.parse_args()
     names = {int(k): v for k, v in json.loads(args.names.read_text()).items()} if args.names.exists() else {}
     episodes = [int(e) for e in args.episodes.split(",")]
     runner = Runner(args.run, names, episodes, args.names)
     runner.fallback_args, runner.no_fallback = args.fallback_args, args.no_fallback
+    runner.joint_args = args.joint_args
+    runner.render, runner.render_args = args.render, args.render_args
     only = [x for x in args.only.split(",") if x]
     assert set(only) <= set(STAGES), f"unknown stages {set(only) - set(STAGES)}"
     runner.go(args.start, only)

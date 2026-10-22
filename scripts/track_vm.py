@@ -144,7 +144,7 @@ def run_episode(model, clip: int, e: int, args) -> None:
         return
     t0 = time.time()
     device = "cuda"
-    frames = read_frames(video_path(args.data, e))
+    frames = read_frames(video_path(args.data, e), [(0, 0, W, H)])[0]  # whole frame, no tiles
     n = len(frames)
     cache = args.cache / name
     mz = np.load(cache / "masks.npz")

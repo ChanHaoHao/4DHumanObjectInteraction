@@ -74,7 +74,7 @@ def stage_motion(args, episodes):
         if path.exists():
             continue
         t0 = time.time()
-        frames = read_frames(video_path(args.data, e))
+        frames = read_frames(video_path(args.data, e), [(0, 0, W, H)])[0]  # whole frame, no tiles
         n = len(frames)
         xs = (np.arange(gw) + 0.5) * W / gw - 0.5
         ys = (np.arange(gh) + 0.5) * H / gh - 0.5

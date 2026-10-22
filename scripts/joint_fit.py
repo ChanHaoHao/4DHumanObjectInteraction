@@ -13,7 +13,7 @@ init run and cache for some episodes, e.g. the hoop from the D4RT pipeline). Per
    log k_t Whittaker-smoothed (--lam-k); the object's depth data uses 1 / k_t, so object depth relative to the
    actor follows the depth map frame by frame (Step 5 used one k per episode: the body's own depth wander
    then shows up as hand-object gaps).
-1. Contact candidates. On scored frames (the contact span), body points whose projection lies within
+1. Contact candidates. On scored frames (the contact span; --contact-frames all: every fitted frame), body points whose projection lies within
    --contact-px (half-resolution px, or 10% of the object's size) of the object mask: hand and sole points
    first; other body points only when no hand or foot is near (sitting, hugging).
 1b. Rotation hypotheses (rotation_hypotheses): poses the image cannot tell apart, e.g. a ring's two tilts (same
@@ -219,7 +219,7 @@ class Episode:
             d[ok] = dt[np.rint(v[ok]).astype(int), np.rint(u[ok]).astype(int)]
             near = d <= max(args.contact_px, 0.1 * np.sqrt(area))
             hand_near[i] = near & (parts.kind == 0)
-            if int(f) not in scored_set:
+            if args.contact_frames == "scored" and int(f) not in scored_set:
                 continue
             limbs = near & (parts.kind < 2)
             cand[i] = limbs if limbs.any() else near & (parts.kind == 2)
@@ -872,7 +872,7 @@ def process_object(name: str, episodes: list[int], args, body, parts, budget, sc
     return stats
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--human", type=Path, required=True, help="episodes dir of the human run (kept as is)")
     parser.add_argument("--init", type=Path, required=True, help="episodes dir of the object run to start from")
@@ -888,6 +888,8 @@ def main():
     parser.add_argument("--lam-k", type=float, default=100.0, help="Whittaker lambda on log k_t")
     # 1. contact candidates
     parser.add_argument("--contact-px", type=float, default=4.0, help="half-resolution px from the object mask")
+    parser.add_argument("--contact-frames", choices=["scored", "all"], default="scored",
+                        help="frames that get contact candidates (render_fit fits every frame: all)")
     parser.add_argument("--depth-gate", type=float, default=0.0,
                         help="m; 0: off. With a hand at the object mask, object depth farther than the hand + this "
                              "is dropped (background through a thin held object: pan 4-6 m with the actor at 3 m)")
@@ -985,7 +987,11 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--per-episode", action="store_true",
                         help="each requested episode alone instead of all episodes of its object")
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
 
     alt = {}
     for spec in args.alt:
