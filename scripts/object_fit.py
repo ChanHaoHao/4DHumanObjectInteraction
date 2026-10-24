@@ -318,24 +318,34 @@ def keyframes(obs: Observations, scored: np.ndarray, count: int) -> list[int]:
     return sorted({int(good[int(round(q))]) for q in np.linspace(0, len(good) - 1, count)})
 
 
-def init_keyframes(obs, model, kfs, args, hyps: int, steps: int):
-    """Best (R, t, log s, loss) per keyframe over `hyps` random rotations."""
+def init_keyframes(obs, model, kfs, args, hyps: int, steps: int, seeds=()):
+    """Best (R, t, log s, loss) per keyframe over `hyps` random rotations. Each seed (k, R, t, log s), a SAM 3D
+    Objects layout pose, adds keyframe k started from that pose and PERTURB rotations of it."""
     H = hyps
     rots = torch.as_tensor(Rotation.random(H, random_state=args.seed).as_matrix(), dtype=torch.float32, device=DEV)
-    idx, R0, t0, s0 = [], [], [], []
+    idx, R0, t0, s0, groups = [], [], [], [], []
     for k in kfs:
         centre, size = obs.init_translation(k)
         idx += [k] * H
         R0.append(rots)
         t0.append(torch.as_tensor(centre, dtype=torch.float32, device=DEV).expand(H, 3))
         s0 += [np.log(max(size, 0.02) / 1.2)] * H  # normalized mesh: projected diagonal ~ 1.2 x scale
+        groups.append((k, H))
+    for k, R_s, t_s, logs_s in seeds:
+        P = len(PERTURB)
+        idx += [k] * P
+        R0.append(PERTURB.to(DEV) @ torch.as_tensor(R_s, dtype=torch.float32, device=DEV))
+        t0.append(torch.as_tensor(t_s, dtype=torch.float32, device=DEV).expand(P, 3))
+        s0 += [logs_s] * P
+        groups.append((k, P))
     idx = torch.as_tensor(idx, device=DEV)
     R, t, logs, loss = optimize(obs, model, idx, torch.cat(R0), torch.cat(t0),
                                 torch.as_tensor(s0, dtype=torch.float32, device=DEV), args, steps)
-    best = []
-    for j, k in enumerate(kfs):
-        b = j * H + int(loss[j * H:(j + 1) * H].argmin())
+    best, j = [], 0
+    for k, n in groups:
+        b = j + int(loss[j:j + n].argmin())
         best.append((k, R[b], t[b], float(logs[b]), float(loss[b])))
+        j += n
     return best
 
 
@@ -455,12 +465,24 @@ class Episode:
         self.frames = episode_range(scored, self.total)
         self.obs = Observations(args.cache, episode, self.frames, self.K, self.depth_scale, seed=args.seed)
         self.kfs = keyframes(self.obs, scored, args.keyframes)
+        # SAM 3D Objects layouts of this episode's crops: [{k, frame, R, t, s}] for the normalized mesh k
+        layout = args.layout / f"episode_{episode:06d}.json" if args.layout else None
+        self.layout = json.loads(layout.read_text()) if layout and layout.exists() else []
 
 
-def init_object(eps: list[Episode], mesh, args, hyps: int, steps: int):
+def layout_seeds(ep: Episode, path: Path) -> list[tuple]:
+    """(keyframe index, R, t, log s) of the SAM 3D layouts made with this mesh (episode_E_K.obj), on fitted frames."""
+    name = path.stem.split("_")
+    if len(name) != 3 or name[0] != "episode" or int(name[1]) != ep.episode:
+        return []
+    return [(int(np.searchsorted(ep.frames, c["frame"])), np.asarray(c["R"]), np.asarray(c["t"]), float(np.log(c["s"])))
+            for c in ep.layout if c["k"] == int(name[2]) and c["frame"] in ep.frames]
+
+
+def init_object(eps: list[Episode], mesh, args, hyps: int, steps: int, path: Path):
     """Keyframe init in every episode with one mesh: ({episode: best per keyframe}, mean loss)."""
     model = Model(mesh, N_MODEL, args.seed)
-    best = {ep.episode: init_keyframes(ep.obs, model, ep.kfs, args, hyps, steps) for ep in eps}
+    best = {ep.episode: init_keyframes(ep.obs, model, ep.kfs, args, hyps, steps, layout_seeds(ep, path)) for ep in eps}
     return best, float(np.mean([np.mean([b[4] for b in v]) for v in best.values()]))
 
 
@@ -475,12 +497,12 @@ def process_object(eps: list[Episode], args) -> list[dict]:
     screen = {}  # cheap pass over every candidate, then the full init on the best few
     if len(meshes) > 1:
         for path, mesh in meshes.items():
-            screen[path] = init_object(eps, mesh, args, args.screen_hyps, args.screen_steps)[1]
+            screen[path] = init_object(eps, mesh, args, args.screen_hyps, args.screen_steps, path)[1]
     else:
         screen = {path: 0.0 for path in meshes}
     timing["screen"] = round(time.time() - t1, 1)
     t1 = time.time()
-    trials = {path: init_object(eps, meshes[path], args, args.hyps, args.init_steps)
+    trials = {path: init_object(eps, meshes[path], args, args.hyps, args.init_steps, path)
               for path in sorted(screen, key=screen.get)[:args.finalists]}
     timing["init"] = round(time.time() - t1, 1)
     path = min(trials, key=lambda p: trials[p][1])
@@ -490,6 +512,9 @@ def process_object(eps: list[Episode], args) -> list[dict]:
     kf_scale = np.array([np.exp(b[3]) for ep in eps for b in best[ep.episode]])
     kf_weight = np.array([1 + 4 * float(ep.obs.has_depth[b[0]]) for ep in eps for b in best[ep.episode]])
     s = weighted_median(kf_scale, kf_weight) if args.share_scale else None
+    layout_s = [np.exp(seed[3]) for ep in eps for seed in layout_seeds(ep, path)]  # the chosen mesh's layouts only
+    if args.layout_scale and layout_s:  # SAM 3D's size from the metric pointmap instead of the keyframe fits
+        s = float(np.median(layout_s))
     model = Model(mesh, N_MODEL, args.seed)
     stats = []
     for ep in eps:
@@ -518,6 +543,7 @@ def process_object(eps: list[Episode], args) -> list[dict]:
             "finalists": {p.name: round(v[1], 4) for p, v in trials.items()},
             "keyframes": [int(ep.frames[b[0]]) for b in kb],
             "keyframe_scales_m": [round(float(np.exp(b[3])), 4) for b in kb],
+            "layout_scales_m": [round(c["s"], 4) for c in ep.layout],
             "keyframe_loss": [round(b[4], 4) for b in kb],
             "timing": ep_timing}))
     return stats
@@ -599,6 +625,10 @@ def main():
                         help="tracking: candidate score += w (rotation change from the previous frame / 0.5 rad)^2")
     parser.add_argument("--acc-t", type=float, default=0.005, help="m/frame^2 scale of the translation penalty")
     parser.add_argument("--acc-r", type=float, default=0.02, help="rad/frame^2 scale of the rotation penalty")
+    parser.add_argument("--layout", type=Path,
+                        help="folder of SAM 3D Objects layouts (episode_E.json: [{k, frame, R, t, s}]): extra start poses")
+    parser.add_argument("--layout-scale", action="store_true",
+                        help="object scale = median of the layout scales (needs --layout)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--per-episode", action="store_true",
                         help="fit each episode alone (own mesh and scale) instead of grouping by object name")

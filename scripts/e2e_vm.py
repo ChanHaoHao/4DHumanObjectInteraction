@@ -420,7 +420,7 @@ class Runner:
         if eps:
             self.sh("object", f"python object_fit.py --human {self.res / self.run}_human/episodes --run {run} "
                               f"--episodes {csv(eps)} --raw {OBJECT_RAW} --cache {CACHE} --data {DATA} "
-                              f"--sample {SAMPLE} --per-episode")
+                              f"--sample {SAMPLE} --per-episode {self.object_args}")
 
     def push(self, stage: str, src: str, dst: str):
         run = self.res / dst
@@ -547,6 +547,7 @@ def main():
     p.add_argument("--only", default="", help="comma-separated stages to run (the rest are assumed done)")
     p.add_argument("--no-fallback", action="store_true", help="keep the named object's track: no motion/depth fallback")
     p.add_argument("--fallback-args", default="", help='extra preprocess_vm.py fallback flags, e.g. "--fg-gap 0.1"')
+    p.add_argument("--object-args", default="", help='extra object_fit.py flags, e.g. "--layout /content/layout"')
     p.add_argument("--joint-args", default="", help='extra joint_fit.py flags, e.g. "--refine full"')
     p.add_argument("--render", action="store_true", help="run the render stage (render_fit.py) before push2")
     p.add_argument("--render-args", default="", help="extra render_fit.py flags")
@@ -555,7 +556,7 @@ def main():
     episodes = [int(e) for e in args.episodes.split(",")]
     runner = Runner(args.run, names, episodes, args.names)
     runner.fallback_args, runner.no_fallback = args.fallback_args, args.no_fallback
-    runner.joint_args = args.joint_args
+    runner.joint_args, runner.object_args = args.joint_args, args.object_args
     runner.render, runner.render_args = args.render, args.render_args
     only = [x for x in args.only.split(",") if x]
     assert set(only) <= set(STAGES), f"unknown stages {set(only) - set(STAGES)}"
