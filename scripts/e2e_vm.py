@@ -148,7 +148,7 @@ source /content/s3denv/bin/activate
 pip install -q torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
 echo "torch==2.5.1" > /content/s3d_pins.txt; echo "torchvision==0.20.1" >> /content/s3d_pins.txt
 grep -v -i -E '^(bpy|auto_gptq|sagemaker|conda-pack|jupyter|polyscope|pyrender|panda3d-gltf|wandb|mosaicml-streaming|pymongo|hdfs|Flask|Werkzeug|librosa|black|flake8|pytest|pdoc3|usort|autoflake|nvidia-pyindex|pip-system-certs|cuda-python|nvidia-cuda-nvcc-cu12|decord|sentence-transformers|optimum|peft|bitsandbytes|torchaudio|OpenEXR|imath|tensorboard|python-pycg|point-cloud-utils|smplx|hydra-submitit-launcher|Rtree|pycocotools|gdown|av|opencv-python)==' \
-    sam3do/requirements.txt > /content/s3d_req.txt
+    sam3do/requirements.txt | sed -E 's/^(open3d|igraph)==.*/\1/I' > /content/s3d_req.txt  # imported; no py3.12 wheel at the pin
 pip install -q -c /content/s3d_pins.txt -r /content/s3d_req.txt opencv-python-headless trimesh fast_simplification \
     --extra-index-url https://download.pytorch.org/whl/cu121
 pip install -q -c /content/s3d_pins.txt \
