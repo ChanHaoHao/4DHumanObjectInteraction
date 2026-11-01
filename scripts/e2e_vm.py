@@ -2,7 +2,7 @@
 """End-to-end Track 1 run on one Colab VM: video + object name -> submission episode. Driven by e2e_colab.py.
 
     python e2e_vm.py --run e2e_v1 --names /content/e2e/names.json [--episodes 0] [--from human]
-        [--only sam,depth,cache,mesh] [--no-fallback]
+        [--only sam,depth,cache,mesh] [--no-fallback] [--sam3d]
 
 names.json maps episode -> object name (the Gemini answer); nothing else about the object is used, and every
 episode goes through the same stages with the same settings (no per-object rules; depth: whole-frame D4RT on
@@ -24,18 +24,19 @@ MoGe-2's metric scale):
           MoGe's kept as depth_moge.npz. /content/cache_d4rt/<ep> already there = reused  d4rt_vm.py
   human   SAM 3D Body per frame -> one smoothed MHR sequence            human_vm.py, human_post.py
   mesh    3 unoccluded object crops -> Hunyuan3D-2.1 meshes             object_vm.py
+          --sam3d (A100): SAM 3D Objects meshes + layouts on the same crops  sam3d_vm.py
   object  mesh choice, scale, pose track (episode fitted alone)         object_fit.py --per-episode
+          (--sam3d: the layouts as extra start poses, --layout)
   push1   hand-penetration push-out (7a)                                pushout.py --w-pen 5 --w-dep 0.3
   joint   contact / floor / per-frame depth placement (7b/7c)           joint_fit.py --per-episode
   render  (--render only) render-and-compare refinement, no depth        render_fit.py
-  push2   push-out again on the placed track (or on render's)           pushout.py --w-pen 5 --w-dep 0.3
-  final   mesh origin at its centroid, smoothed translation, hands out  finalize.py
+  final   mesh origin at its centroid, smoothed translation, hands out  finalize.py (on joint's or render's track)
   eval    proxy metrics and the overlay | side-view video               proxy_eval.py, render_video.py
 
 Stages whose outputs exist are skipped, so a rerun resumes. Installs happen just before the first stage that needs
 them (marker /content/installed_<group>). Layout: /content/repo mirrors the repo (scripts, cache, results, kit,
 body_models), videos + meta under /content/v2d/track_1. Runs: results/<run>_human, <run>_obj, <run>_p1, <run>_j,
-<run>_p2, <run> (final). Progress: /content/e2e/<run>/status.json, stage logs in /content/e2e/<run>/logs/.
+<run>_r, <run> (final). Progress: /content/e2e/<run>/status.json, stage logs in /content/e2e/<run>/logs/.
 """
 
 from __future__ import annotations
@@ -59,11 +60,12 @@ SAMPLE = REPO / "data/v2d_submission_kit/data/track_1_sample_submission.parquet"
 RAW, HUMAN_RAW, OBJECT_RAW = Path("/content/raw"), Path("/content/human_raw"), Path("/content/object_raw")
 MOTION, CACHE_MOTION = Path("/content/motion"), Path("/content/cache_motion")
 CACHE_D4RT = Path("/content/cache_d4rt")
+S3D_IN, S3D_OUT, LAYOUT = Path("/content/sam3d_inputs"), Path("/content/sam3d_raw"), Path("/content/layout")
 LOCATE, CACHE_BOX = Path("/content/locate"), Path("/content/cache_box")
 STILL, MIN_COVER = 0.85, 0.5  # track check, read off eps 0-29 of e2e_v1 (notes/preprocess.md)
 SAME_OBJECT = 0.35  # motion track this much inside the Gemini track = a moving part of the named object (desk legs)
-STAGES = ["name", "locate", "sam", "depth", "cache", "d4rt", "human", "mesh", "object", "push1", "joint", "render", "push2",
-          "final", "eval"]
+STAGES = ["name", "locate", "sam", "depth", "cache", "d4rt", "human", "mesh", "object", "push1", "joint", "render", "final",
+          "eval"]
 PINS = "python -c \"import torch, torchvision; print(f'torch=={torch.__version__}'); " \
        "print(f'torchvision=={torchvision.__version__}')\" > /content/pins.txt"
 MHR = r"""
@@ -135,6 +137,36 @@ for f in ('model.yaml', 'opend4rt.ckpt'):
     "fit": PINS + r"""
 pip install -q -c /content/pins.txt trimesh fast_simplification pyarrow pandas scipy numba opencv-python-headless
 """ + MHR,
+    # SAM 3D Objects (--sam3d) in a python 3.12 venv: Colab's python is 3.13, torch 2.5.1 and the prebuilt wheels
+    # stop at 3.12; the repo's research-only pins dropped. Needs an A100 (>= 32 GB) to run
+    "s3d": r"""
+cd /content
+pip install -q uv
+[ -x /content/s3denv/bin/python ] || uv venv -q --seed --python 3.12 /content/s3denv
+source /content/s3denv/bin/activate
+[ -d sam3do ] || git clone -q --depth 1 https://github.com/facebookresearch/sam-3d-objects.git sam3do
+pip install -q torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+echo "torch==2.5.1" > /content/s3d_pins.txt; echo "torchvision==0.20.1" >> /content/s3d_pins.txt
+grep -v -i -E '^(bpy|auto_gptq|sagemaker|conda-pack|jupyter|polyscope|pyrender|panda3d-gltf|wandb|mosaicml-streaming|pymongo|hdfs|Flask|Werkzeug|librosa|black|flake8|pytest|pdoc3|usort|autoflake|nvidia-pyindex|pip-system-certs|cuda-python|nvidia-cuda-nvcc-cu12|decord|sentence-transformers|optimum|peft|bitsandbytes|torchaudio|OpenEXR|imath|tensorboard|python-pycg|point-cloud-utils|smplx|hydra-submitit-launcher|Rtree|pycocotools|gdown|av|opencv-python)==' \
+    sam3do/requirements.txt > /content/s3d_req.txt
+pip install -q -c /content/s3d_pins.txt -r /content/s3d_req.txt opencv-python-headless trimesh fast_simplification \
+    --extra-index-url https://download.pytorch.org/whl/cu121
+pip install -q -c /content/s3d_pins.txt \
+    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" \
+    pytorch3d==0.7.9+pt2.5.1cu121 --extra-index-url https://miropsota.github.io/torch_packages_builder \
+    kaolin==0.17.0 -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.5.1_cu121.html
+# gsplat: the PyPI wheel JIT-compiles only when rasterizing (never on this path); the pinned git build fails here
+pip install -q -c /content/s3d_pins.txt gsplat==1.4.0 seaborn==0.13.2
+cd sam3do && pip install -q -c /content/s3d_pins.txt --no-deps -e . && python patching/hydra
+pip install -q 'huggingface-hub[cli]<1.0'
+pip install -q numpy==1.26.4  # kaolin 0.17 wheels are built against numpy 1.x
+pip install -q --force-reinstall --no-deps pandas==2.2.3  # a numpy-1 build
+if [ ! -f checkpoints/hf/pipeline.yaml ]; then
+  hf download --repo-type model --local-dir checkpoints/hf-download facebook/sam-3d-objects
+  mv checkpoints/hf-download/checkpoints checkpoints/hf && rm -rf checkpoints/hf-download
+fi
+python -c "import torch, pytorch3d, flash_attn, kaolin, spconv; print('imports ok', torch.__version__, torch.cuda.get_device_name())"
+""",
     # nvdiffrast 0.4 builds its CUDA plugin at install (0.3.3 left none: "No module named nvdiffrast_plugin"); no OpenGL
     "render": PINS + r"""
 pip install -q -c /content/pins.txt trimesh fast_simplification pyarrow pandas scipy numba opencv-python-headless ninja
@@ -143,10 +175,9 @@ python -c "import nvdiffrast.torch as dr, torch; dr.RasterizeCudaContext(); prin
 """ + MHR,
 }
 NEEDS = {"name": "data", "locate": "locate", "sam": "sam", "depth": "sam", "cache": "sam", "d4rt": "data", "human": "body", "mesh": "mesh",
-         "object": "fit", "push1": "fit", "joint": "fit", "render": "render", "push2": "fit", "final": "fit",
-         "eval": "fit"}
+         "object": "fit", "push1": "fit", "joint": "fit", "render": "render", "final": "fit", "eval": "fit"}
 PUSH = "--w-pen 5 --w-dep 0.3"  # Step 7a settings, every episode
-FINAL = ""  # finalize.py defaults
+FINAL = "--lam-o 100000 --lam-h 1000,600,600"  # the reference run's (lay_jfin)
 
 
 def ep(e: int) -> str:
@@ -194,7 +225,8 @@ class Runner:
         if not index.exists():
             return False
         crops = json.loads(index.read_text())
-        return bool(crops) and all((OBJECT_RAW / "meshes" / f"{ep(e)}_{c['k']}.obj").exists() for c in crops)
+        return (bool(crops) and all((OBJECT_RAW / "meshes" / f"{ep(e)}_{c['k']}.obj").exists() for c in crops)
+                and (not self.sam3d or (LAYOUT / f"{ep(e)}.json").exists()))
 
     def outputs(self, stage: str, e: int) -> bool:
         """True when `stage` has produced what the next stage needs for episode e."""
@@ -214,7 +246,6 @@ class Runner:
             "push1": lambda: (r / f"{self.run}_p1/episodes/{n}.npz").exists(),
             "joint": lambda: (r / f"{self.run}_j/episodes/{n}.npz").exists(),
             "render": lambda: (r / f"{self.run}_r/render_meta/{n}.json").exists(),
-            "push2": lambda: (r / f"{self.run}_p2/episodes/{n}.npz").exists(),
             "final": lambda: (r / f"{self.run}/episodes/{n}.npz").exists(),
             "eval": lambda: (r / f"{self.run}/videos/{n}.mp4").exists(),
         }[stage]()
@@ -410,9 +441,22 @@ class Runner:
             self.sh("mesh", f"python object_vm.py --stage crops --episodes {csv(eps)} --data {DATA} --cache {CACHE} "
                             f"--out {OBJECT_RAW}")
         eps = [e for e in self.episodes if (OBJECT_RAW / "crops" / f"{ep(e)}.json").exists() and not self.meshed(e)]
-        if eps:
+        if eps and self.sam3d:
+            self.mesh_sam3d(eps)
+        elif eps:
             self.sh("mesh", f"PYTHONPATH=/content/mesh_pkgs python object_vm.py --stage mesh --episodes {csv(eps)} --data {DATA} --cache {CACHE} "
                             f"--out {OBJECT_RAW}")
+
+    def mesh_sam3d(self, eps: list[int]):
+        """SAM 3D Objects on the crops, with our body-scale pointmap: meshes + layouts (sam3d_vm.py)."""
+        self.install("fit", "mesh")  # trimesh + fast_simplification for the import
+        self.sh("mesh", f"python sam3d_vm.py --stage inputs --episodes {csv(eps)} --data {DATA} --cache {CACHE} "
+                        f"--human {self.res / self.run}_human/episodes --raw {OBJECT_RAW} --out {S3D_IN}")
+        self.sh("mesh", f"source /content/s3denv/bin/activate && CONDA_PREFIX=/usr/local/cuda python {SCRIPTS}/sam3d_vm.py "
+                        f"--stage infer --episodes {csv(eps)} --inputs {S3D_IN} --out {S3D_OUT}",
+                cwd=Path("/content/sam3do/notebook"))
+        self.sh("mesh", f"python sam3d_vm.py --stage import --episodes {csv(eps)} --s3d {S3D_OUT} --raw {OBJECT_RAW} "
+                        f"--layout {LAYOUT}")
 
     def stage_object(self):
         run = self.res / f"{self.run}_obj"
@@ -420,7 +464,8 @@ class Runner:
         if eps:
             self.sh("object", f"python object_fit.py --human {self.res / self.run}_human/episodes --run {run} "
                               f"--episodes {csv(eps)} --raw {OBJECT_RAW} --cache {CACHE} --data {DATA} "
-                              f"--sample {SAMPLE} --per-episode {self.object_args}")
+                              f"--sample {SAMPLE} --per-episode {self.object_args}"
+                              + (f" --layout {LAYOUT}" if self.sam3d else ""))
 
     def push(self, stage: str, src: str, dst: str):
         run = self.res / dst
@@ -448,14 +493,12 @@ class Runner:
                               f"--init {self.res / self.run}_j/episodes --run {run} --episodes {csv(eps)} "
                               f"--cache {CACHE} --data {DATA} --sample {SAMPLE} {self.render_args}")
 
-    def stage_push2(self):
-        self.push("push2", f"{self.run}_r" if self.render else f"{self.run}_j", f"{self.run}_p2")
-
     def stage_final(self):
         run = self.res / self.run
         eps = self.todo(lambda e: (run / "episodes" / f"{ep(e)}.npz").exists())
         if eps:
-            self.sh("final", f"python finalize.py --src {self.res / self.run}_p2/episodes --run {run} "
+            src = f"{self.run}_r" if self.render else f"{self.run}_j"
+            self.sh("final", f"python finalize.py --src {self.res / src}/episodes --run {run} "
                              f"--episodes {csv(eps)} --sample {SAMPLE} {FINAL}")
 
     def stage_eval(self):
@@ -480,7 +523,7 @@ class Runner:
             self.save()
             t0, error = time.time(), None
             try:
-                self.install(NEEDS[stage], stage)
+                self.install("s3d" if stage == "mesh" and self.sam3d else NEEDS[stage], stage)
                 getattr(self, f"stage_{stage}")()
             except Exception as err:  # a multi-episode call can fail on one episode; outputs decide below
                 error = str(err)
@@ -549,7 +592,8 @@ def main():
     p.add_argument("--fallback-args", default="", help='extra preprocess_vm.py fallback flags, e.g. "--fg-gap 0.1"')
     p.add_argument("--object-args", default="", help='extra object_fit.py flags, e.g. "--layout /content/layout"')
     p.add_argument("--joint-args", default="", help='extra joint_fit.py flags, e.g. "--refine full"')
-    p.add_argument("--render", action="store_true", help="run the render stage (render_fit.py) before push2")
+    p.add_argument("--sam3d", action="store_true", help="mesh stage: SAM 3D Objects meshes + layouts (A100)")
+    p.add_argument("--render", action="store_true", help="run the render stage (render_fit.py) before final")
     p.add_argument("--render-args", default="", help="extra render_fit.py flags")
     args = p.parse_args()
     names = {int(k): v for k, v in json.loads(args.names.read_text()).items()} if args.names.exists() else {}
@@ -557,7 +601,7 @@ def main():
     runner = Runner(args.run, names, episodes, args.names)
     runner.fallback_args, runner.no_fallback = args.fallback_args, args.no_fallback
     runner.joint_args, runner.object_args = args.joint_args, args.object_args
-    runner.render, runner.render_args = args.render, args.render_args
+    runner.render, runner.render_args, runner.sam3d = args.render, args.render_args, args.sam3d
     only = [x for x in args.only.split(",") if x]
     assert set(only) <= set(STAGES), f"unknown stages {set(only) - set(STAGES)}"
     runner.go(args.start, only)

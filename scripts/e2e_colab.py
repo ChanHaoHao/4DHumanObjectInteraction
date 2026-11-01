@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end Track 1 run: object name from Gemini (local), every other stage on one Colab VM (e2e_vm.py).
 
-    colab new -s e2e --gpu L4
+    colab new -s e2e --gpu L4                    # A100 with --sam3d (SAM 3D Objects needs >= 32 GB)
     python3 scripts/e2e_colab.py run e2e --episodes 0 [--run e2e_v1] [--from human]   # name, upload, launch, follow
     python3 scripts/e2e_colab.py follow e2e --run e2e_v1                               # re-attach: keepalive + pulls
     python3 scripts/e2e_colab.py status e2e --run e2e_v1
@@ -11,7 +11,7 @@ results/gemini_object/answers.json, launches e2e_vm.py detached and follows it. 
 HF dataset and the name stage asks Gemini for the episodes not named yet (answers merged back into answers.json). `follow` pings the kernel every 4 min (Colab reclaims a VM ~45 min after the last kernel
 interaction) and pulls each stage's outputs when it finishes, into results/<run>/ (the laptop is the store):
   cache/episode_X/          masks, depth, camera, meta (separate from the repo's cache/)
-  cache_check/, object_raw/ track overlays, crops + meshes
+  cache_check/, object_raw/ track overlays, crops + meshes (+ layout/ with --sam3d)
   stages/<stage>/           episodes/ (+ meta) of the intermediate runs: human, obj, p1, j
   episodes/                 the final submission-format episodes; proxy_eval.{csv,txt}; videos/
   logs/, status.json
@@ -37,9 +37,9 @@ ROOT = Path(__file__).resolve().parents[1]
 VM = "/content/repo"
 SCRIPTS = ["e2e_vm.py", "gemini_object.py", "preprocess_vm.py", "build_cache.py", "human_vm.py", "human_post.py", "object_vm.py",
            "object_fit.py", "pushout.py", "joint_fit.py", "proxy_eval.py", "render_video.py",
-           "track_check.py", "motion_vm.py", "d4rt_vm.py", "locate_vm.py", "render_fit.py", "finalize.py"]
+           "track_check.py", "motion_vm.py", "d4rt_vm.py", "locate_vm.py", "render_fit.py", "finalize.py", "sam3d_vm.py"]
 VIDEOS = "videos/chunk-000/observation.images.exo_camera"
-STAGES = ["name", "locate", "sam", "depth", "cache", "d4rt", "human", "mesh", "object", "push1", "joint", "render", "push2", "final", "eval"]
+STAGES = ["name", "locate", "sam", "depth", "cache", "d4rt", "human", "mesh", "object", "push1", "joint", "render", "final", "eval"]
 
 
 def known_names(episodes: list[int]) -> dict[int, str]:
@@ -138,6 +138,8 @@ def pull_stage(session: str, run: str, stage: str, episodes: list[int]):
     elif stage == "mesh":
         for sub in ("crops", "meshes"):
             pull_dir(session, f"/content/object_raw/{sub}", dst / "object_raw" / sub, names, force=True)
+        if ls(session, "/content/layout"):  # --sam3d
+            pull_dir(session, "/content/layout", dst / "object_raw/layout", names, force=True)
     elif stage == "render":
         for sub in ("episodes", "render_meta", "videos"):
             pull_dir(session, f"{res}/{run}_r/{sub}", dst / "stages/render" / sub, names, force=True)
@@ -145,8 +147,6 @@ def pull_stage(session: str, run: str, stage: str, episodes: list[int]):
         src = {"object": f"{run}_obj", "push1": f"{run}_p1", "joint": f"{run}_j"}[stage]
         for sub in ("episodes", "object_meta", "joint_meta"):
             pull_dir(session, f"{res}/{src}/{sub}", dst / "stages" / stage / sub, names, force=True)
-    elif stage == "push2":
-        pull_dir(session, f"{res}/{run}_p2/episodes", dst / "stages/push2/episodes", names, force=True)
     elif stage == "final":
         pull_dir(session, f"{res}/{run}/episodes", dst / "episodes", names, force=True)
     elif stage == "eval":
@@ -234,6 +234,7 @@ def main():
             s.add_argument("--fallback-args", default="", help="forwarded to e2e_vm.py")
             s.add_argument("--joint-args", default="", help="forwarded to e2e_vm.py")
             s.add_argument("--render", action="store_true", help="forwarded to e2e_vm.py")
+            s.add_argument("--sam3d", action="store_true", help="forwarded to e2e_vm.py (needs an A100 session)")
             s.add_argument("--render-args", default="", help="forwarded to e2e_vm.py")
             s.add_argument("--names", type=Path, help="JSON episode -> object name, used instead of Gemini's answers")
             s.add_argument("--only", default="", help="forwarded to e2e_vm.py")
@@ -253,7 +254,7 @@ def main():
                f"cd {VM}/scripts && python e2e_vm.py --run {args.run} --names /content/e2e/{args.run}/names.json "
                f"--episodes {','.join(map(str, episodes))} --from {args.start} "
                f"--fallback-args '{args.fallback_args}' --joint-args '{args.joint_args}' "
-               f"--render-args '{args.render_args}'" + (" --render" if args.render else "") + (f" --only {args.only}" if args.only else "")
+               f"--render-args '{args.render_args}'" + (" --render" if args.render else "") + (" --sam3d" if args.sam3d else "") + (f" --only {args.only}" if args.only else "")
                + (" --no-fallback" if args.no_fallback else ""))
     skip = tuple(STAGES[:STAGES.index(args.start)]) if args.cmd == "run" else ()
     return follow(args.session, args.run, skip=skip)
