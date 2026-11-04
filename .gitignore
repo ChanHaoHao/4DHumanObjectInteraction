@@ -4,3 +4,4 @@ data/
 results/
 cache/
 __pycache__/
+report/*.log
